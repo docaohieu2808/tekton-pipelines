@@ -1,0 +1,228 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: git-webhook-listener
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+spec:
+  serviceAccountName: tekton-triggers-sa
+  resources:
+    kubernetesResource:
+      spec:
+        template:
+          spec:
+            containers:
+              - resources:
+                  requests:
+                    cpu: 100m
+                    memory: 64Mi
+                  limits:
+                    cpu: 500m
+                    memory: 256Mi
+  triggers:
+    # =========================================================================
+    # GitHub — push events
+    # Webhook secret verified via HMAC-SHA256 header X-Hub-Signature-256
+    # =========================================================================
+    - name: github-push
+      interceptors:
+        - ref:
+            name: github
+            kind: ClusterInterceptor
+          params:
+            - name: secretRef
+              value:
+                secretName: github-webhook-secret
+                secretKey: secret
+            - name: eventTypes
+              value:
+                - push
+        - ref:
+            name: cel
+            kind: ClusterInterceptor
+          params:
+            - name: filter
+              # Only trigger on branch pushes, ignore tag-only or delete events
+              value: "body.ref.startsWith('refs/heads/') && body.after != '0000000000000000000000000000000000000000'"
+            - name: overlays
+              value:
+                - key: git_revision
+                  expression: "body.ref.split('/')[2]"
+      bindings:
+        - ref: git-webhook-binding-github
+      template:
+        ref: auto-pipeline-trigger-template
+
+    # =========================================================================
+    # GitLab — push events
+    # Webhook token verified via X-Gitlab-Token header
+    # =========================================================================
+    - name: gitlab-push
+      interceptors:
+        - ref:
+            name: gitlab
+            kind: ClusterInterceptor
+          params:
+            - name: secretRef
+              value:
+                secretName: gitlab-webhook-secret
+                secretKey: secret
+            - name: eventTypes
+              value:
+                - Push Hook
+                - Tag Push Hook
+        - ref:
+            name: cel
+            kind: ClusterInterceptor
+          params:
+            - name: filter
+              value: "body.ref.startsWith('refs/heads/') && body.after != '0000000000000000000000000000000000000000'"
+            - name: overlays
+              value:
+                - key: git_revision
+                  expression: "body.ref.split('/')[2]"
+      bindings:
+        - ref: git-webhook-binding-gitlab
+      template:
+        ref: auto-pipeline-trigger-template
+
+    # =========================================================================
+    # Bitbucket Cloud — repo:push events
+    # Verified via IP allowlist or shared secret in custom header
+    # =========================================================================
+    - name: bitbucket-push
+      interceptors:
+        - ref:
+            name: cel
+            kind: ClusterInterceptor
+          params:
+            - name: filter
+              # Bitbucket sends X-Event-Key: repo:push
+              value: "header.match('X-Event-Key', 'repo:push')"
+            - name: overlays
+              value:
+                - key: git_revision
+                  expression: "body.push.changes[0].new.name"
+      bindings:
+        - ref: git-webhook-binding-bitbucket
+      template:
+        ref: auto-pipeline-trigger-template
+
+    # =========================================================================
+    # Gitea — push events
+    # Webhook secret verified via X-Gitea-Signature (HMAC-SHA256, same as GitHub)
+    # =========================================================================
+    - name: gitea-push
+      interceptors:
+        - ref:
+            name: github
+            kind: ClusterInterceptor
+          params:
+            - name: secretRef
+              value:
+                secretName: gitea-webhook-secret
+                secretKey: secret
+            - name: eventTypes
+              value:
+                - push
+        - ref:
+            name: cel
+            kind: ClusterInterceptor
+          params:
+            - name: filter
+              value: "body.ref.startsWith('refs/heads/') && body.after != '0000000000000000000000000000000000000000'"
+            - name: overlays
+              value:
+                - key: git_revision
+                  expression: "body.ref.split('/')[2]"
+      bindings:
+        - ref: git-webhook-binding-gitea
+      template:
+        ref: auto-pipeline-trigger-template
+
+---
+# ServiceAccount with minimum RBAC for the EventListener pod
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tekton-triggers-sa
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tekton-triggers-role
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+rules:
+  - apiGroups: ["triggers.tekton.dev"]
+    resources:
+      - eventlisteners
+      - triggerbindings
+      - triggertemplates
+      - triggers
+      - clusterinterceptors
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["tekton.dev"]
+    resources:
+      - pipelineruns
+      - pipelineresources
+    verbs: ["create", "get", "list", "watch"]
+  - apiGroups: [""]
+    resources:
+      - configmaps
+      - secrets
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tekton-triggers-rolebinding
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+subjects:
+  - kind: ServiceAccount
+    name: tekton-triggers-sa
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: tekton-triggers-role
+---
+# ClusterRoleBinding for ClusterInterceptor access
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tekton-triggers-clusterrolebinding
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+subjects:
+  - kind: ServiceAccount
+    name: tekton-triggers-sa
+    namespace: tekton-pipelines
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tekton-triggers-eventlistener-clusterrole
+---
+# Expose EventListener via a LoadBalancer Service for external webhook ingress.
+# For production, replace with an Ingress + cert-manager TLS termination.
+apiVersion: v1
+kind: Service
+metadata:
+  name: git-webhook-listener-svc
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+  annotations:
+    # Uncomment to use internal LB on cloud providers
+    # service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+spec:
+  selector:
+    app.kubernetes.io/managed-by: EventListener
+    eventlistener: git-webhook-listener
+  ports:
+    - name: http-webhook
+      protocol: TCP
+      port: 8080
+      targetPort: 8080
+  type: LoadBalancer

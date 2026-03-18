@@ -1,0 +1,186 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: detect-language
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+spec:
+  description: |
+    Detects language, framework, and build tool from project files.
+    Checks: package.json (Node), pom.xml/build.gradle (Java), go.mod (Go),
+    requirements.txt/pyproject.toml/setup.py (Python), composer.json (PHP),
+    Cargo.toml (Rust).
+  params:
+    - name: source-path
+      description: Path to the cloned source code workspace
+      type: string
+      default: /workspace/source
+  workspaces:
+    - name: source
+      description: Workspace containing cloned source code
+  results:
+    - name: language
+      description: Detected programming language (node, java, go, python, php, rust, unknown)
+    - name: framework
+      description: Detected framework (e.g. spring, express, gin, django, laravel, actix)
+    - name: build-tool
+      description: Detected build tool (npm, yarn, pnpm, maven, gradle, go, pip, poetry, composer, cargo)
+    - name: dockerfile-exists
+      description: Whether a Dockerfile already exists (true/false)
+    - name: test-command
+      description: Suggested test command for the detected stack
+    - name: build-command
+      description: Suggested build command for the detected stack
+  steps:
+    - name: detect
+      image: alpine:3.19
+      script: |
+        #!/bin/sh
+        set -e
+        SRC="$(workspaces.source.path)"
+
+        LANGUAGE="unknown"
+        FRAMEWORK="none"
+        BUILD_TOOL="none"
+        TEST_CMD="echo 'No test command detected'"
+        BUILD_CMD="echo 'No build command detected'"
+
+        # --- Node.js ---
+        if [ -f "$SRC/package.json" ]; then
+          LANGUAGE="node"
+          # Detect package manager
+          if [ -f "$SRC/pnpm-lock.yaml" ]; then
+            BUILD_TOOL="pnpm"
+          elif [ -f "$SRC/yarn.lock" ]; then
+            BUILD_TOOL="yarn"
+          else
+            BUILD_TOOL="npm"
+          fi
+          # Detect framework
+          if grep -q '"next"' "$SRC/package.json" 2>/dev/null; then
+            FRAMEWORK="nextjs"
+          elif grep -q '"nuxt"' "$SRC/package.json" 2>/dev/null; then
+            FRAMEWORK="nuxt"
+          elif grep -q '"express"' "$SRC/package.json" 2>/dev/null; then
+            FRAMEWORK="express"
+          elif grep -q '"fastify"' "$SRC/package.json" 2>/dev/null; then
+            FRAMEWORK="fastify"
+          elif grep -q '"@nestjs/core"' "$SRC/package.json" 2>/dev/null; then
+            FRAMEWORK="nestjs"
+          elif grep -q '"react"' "$SRC/package.json" 2>/dev/null; then
+            FRAMEWORK="react"
+          elif grep -q '"vue"' "$SRC/package.json" 2>/dev/null; then
+            FRAMEWORK="vue"
+          fi
+          BUILD_CMD="$BUILD_TOOL run build"
+          TEST_CMD="$BUILD_TOOL test"
+
+        # --- Java (Maven) ---
+        elif [ -f "$SRC/pom.xml" ]; then
+          LANGUAGE="java"
+          BUILD_TOOL="maven"
+          if grep -q 'spring-boot' "$SRC/pom.xml" 2>/dev/null; then
+            FRAMEWORK="spring"
+          elif grep -q 'quarkus' "$SRC/pom.xml" 2>/dev/null; then
+            FRAMEWORK="quarkus"
+          fi
+          BUILD_CMD="mvn package -DskipTests"
+          TEST_CMD="mvn test"
+
+        # --- Java (Gradle) ---
+        elif [ -f "$SRC/build.gradle" ] || [ -f "$SRC/build.gradle.kts" ]; then
+          LANGUAGE="java"
+          BUILD_TOOL="gradle"
+          if grep -q 'spring' "$SRC/build.gradle" 2>/dev/null || grep -q 'spring' "$SRC/build.gradle.kts" 2>/dev/null; then
+            FRAMEWORK="spring"
+          fi
+          BUILD_CMD="./gradlew build -x test"
+          TEST_CMD="./gradlew test"
+
+        # --- Go ---
+        elif [ -f "$SRC/go.mod" ]; then
+          LANGUAGE="go"
+          BUILD_TOOL="go"
+          if grep -q 'gin-gonic/gin' "$SRC/go.mod" 2>/dev/null; then
+            FRAMEWORK="gin"
+          elif grep -q 'labstack/echo' "$SRC/go.mod" 2>/dev/null; then
+            FRAMEWORK="echo"
+          elif grep -q 'gofiber/fiber' "$SRC/go.mod" 2>/dev/null; then
+            FRAMEWORK="fiber"
+          fi
+          BUILD_CMD="go build -o app ./..."
+          TEST_CMD="go test ./..."
+
+        # --- Python ---
+        elif [ -f "$SRC/pyproject.toml" ]; then
+          LANGUAGE="python"
+          BUILD_TOOL="poetry"
+          if grep -q 'django' "$SRC/pyproject.toml" 2>/dev/null; then
+            FRAMEWORK="django"
+          elif grep -q 'fastapi' "$SRC/pyproject.toml" 2>/dev/null; then
+            FRAMEWORK="fastapi"
+          elif grep -q 'flask' "$SRC/pyproject.toml" 2>/dev/null; then
+            FRAMEWORK="flask"
+          fi
+          BUILD_CMD="poetry build"
+          TEST_CMD="poetry run pytest"
+        elif [ -f "$SRC/requirements.txt" ]; then
+          LANGUAGE="python"
+          BUILD_TOOL="pip"
+          if grep -q -i 'django' "$SRC/requirements.txt" 2>/dev/null; then
+            FRAMEWORK="django"
+          elif grep -q -i 'fastapi' "$SRC/requirements.txt" 2>/dev/null; then
+            FRAMEWORK="fastapi"
+          elif grep -q -i 'flask' "$SRC/requirements.txt" 2>/dev/null; then
+            FRAMEWORK="flask"
+          fi
+          BUILD_CMD="pip install -r requirements.txt"
+          TEST_CMD="python -m pytest"
+        elif [ -f "$SRC/setup.py" ]; then
+          LANGUAGE="python"
+          BUILD_TOOL="pip"
+          BUILD_CMD="python setup.py build"
+          TEST_CMD="python -m pytest"
+
+        # --- PHP ---
+        elif [ -f "$SRC/composer.json" ]; then
+          LANGUAGE="php"
+          BUILD_TOOL="composer"
+          if grep -q 'laravel/framework' "$SRC/composer.json" 2>/dev/null; then
+            FRAMEWORK="laravel"
+          elif grep -q 'symfony/framework-bundle' "$SRC/composer.json" 2>/dev/null; then
+            FRAMEWORK="symfony"
+          fi
+          BUILD_CMD="composer install --no-dev --optimize-autoloader"
+          TEST_CMD="./vendor/bin/phpunit"
+
+        # --- Rust ---
+        elif [ -f "$SRC/Cargo.toml" ]; then
+          LANGUAGE="rust"
+          BUILD_TOOL="cargo"
+          if grep -q 'actix-web' "$SRC/Cargo.toml" 2>/dev/null; then
+            FRAMEWORK="actix"
+          elif grep -q 'axum' "$SRC/Cargo.toml" 2>/dev/null; then
+            FRAMEWORK="axum"
+          fi
+          BUILD_CMD="cargo build --release"
+          TEST_CMD="cargo test"
+        fi
+
+        # --- Dockerfile detection ---
+        DOCKERFILE_EXISTS="false"
+        if [ -f "$SRC/Dockerfile" ] || [ -f "$SRC/dockerfile" ]; then
+          DOCKERFILE_EXISTS="true"
+        fi
+
+        echo "Detected: language=$LANGUAGE framework=$FRAMEWORK build-tool=$BUILD_TOOL"
+        echo "Build: $BUILD_CMD"
+        echo "Test: $TEST_CMD"
+        echo "Dockerfile exists: $DOCKERFILE_EXISTS"
+
+        printf '%s' "$LANGUAGE"        > $(results.language.path)
+        printf '%s' "$FRAMEWORK"       > $(results.framework.path)
+        printf '%s' "$BUILD_TOOL"      > $(results.build-tool.path)
+        printf '%s' "$DOCKERFILE_EXISTS" > $(results.dockerfile-exists.path)
+        printf '%s' "$BUILD_CMD"       > $(results.build-command.path)
+        printf '%s' "$TEST_CMD"        > $(results.test-command.path)

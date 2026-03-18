@@ -1,0 +1,263 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: docker-build-kaniko
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+spec:
+  description: |
+    Builds and pushes a Docker image using Kaniko (no Docker daemon required,
+    no privileged containers). Supports auto-generated Dockerfile when none exists
+    in the repo, based on the detected language/framework.
+  params:
+    - name: image
+      description: Full image name with registry and tag (e.g. registry.example.com/myapp:latest)
+      type: string
+    - name: dockerfile-path
+      description: Path to Dockerfile relative to context
+      type: string
+      default: ./Dockerfile
+    - name: context
+      description: Docker build context path within workspace
+      type: string
+      default: ./
+    - name: language
+      description: Detected language (used to generate Dockerfile if none exists)
+      type: string
+      default: "unknown"
+    - name: framework
+      description: Detected framework (used to generate Dockerfile if none exists)
+      type: string
+      default: "none"
+    - name: build-tool
+      description: Detected build tool (used to generate Dockerfile if none exists)
+      type: string
+      default: "none"
+    - name: dockerfile-exists
+      description: Whether a Dockerfile already exists in the repo (true/false)
+      type: string
+      default: "false"
+    - name: extra-build-args
+      description: Extra --build-arg flags passed to Kaniko (e.g. --build-arg=FOO=bar)
+      type: string
+      default: ""
+    - name: skip-push
+      description: Set to "true" to build without pushing (useful for testing)
+      type: string
+      default: "false"
+    - name: insecure-registry
+      description: Set to "true" if registry does not use TLS
+      type: string
+      default: "false"
+  workspaces:
+    - name: source
+      description: Workspace containing application source code
+    - name: docker-credentials
+      description: Workspace containing Docker registry credentials (config.json)
+      optional: true
+  results:
+    - name: image-digest
+      description: SHA256 digest of the pushed image
+    - name: image-url
+      description: Full image URL that was pushed
+  steps:
+    - name: generate-dockerfile-if-missing
+      image: alpine:3.19
+      script: |
+        #!/bin/sh
+        set -e
+        SRC="$(workspaces.source.path)"
+        LANGUAGE="$(params.language)"
+        FRAMEWORK="$(params.framework)"
+        BUILD_TOOL="$(params.build-tool)"
+        EXISTS="$(params.dockerfile-exists)"
+
+        if [ "$EXISTS" = "true" ]; then
+          echo "==> Dockerfile already exists, skipping generation"
+          exit 0
+        fi
+
+        echo "==> Generating Dockerfile for language=$LANGUAGE framework=$FRAMEWORK build-tool=$BUILD_TOOL"
+
+        case "$LANGUAGE" in
+          node)
+            case "$BUILD_TOOL" in
+              pnpm)
+                INSTALL_CMD="npm install -g pnpm && pnpm install --frozen-lockfile"
+                BUILD_CMD="pnpm run build"
+                ;;
+              yarn)
+                INSTALL_CMD="npm install -g yarn && yarn install --frozen-lockfile"
+                BUILD_CMD="yarn build"
+                ;;
+              *)
+                INSTALL_CMD="npm ci"
+                BUILD_CMD="npm run build"
+                ;;
+            esac
+            cat > "$SRC/Dockerfile" <<DOCKERFILE
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN $INSTALL_CMD
+COPY . .
+RUN $BUILD_CMD
+
+FROM node:20-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=builder /app ./
+EXPOSE 3000
+CMD ["node", "dist/index.js"]
+DOCKERFILE
+            ;;
+
+          java)
+            case "$BUILD_TOOL" in
+              gradle)
+                BUILD_CMD="./gradlew build -x test"
+                ARTIFACT_PATH="build/libs/*.jar"
+                ;;
+              *)
+                BUILD_CMD="mvn package -DskipTests"
+                ARTIFACT_PATH="target/*.jar"
+                ;;
+            esac
+            cat > "$SRC/Dockerfile" <<DOCKERFILE
+FROM eclipse-temurin:21-jdk-alpine AS builder
+WORKDIR /app
+COPY . .
+RUN $BUILD_CMD
+
+FROM eclipse-temurin:21-jre-alpine AS runner
+WORKDIR /app
+COPY --from=builder /app/$ARTIFACT_PATH app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]
+DOCKERFILE
+            ;;
+
+          go)
+            cat > "$SRC/Dockerfile" <<DOCKERFILE
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o app ./...
+
+FROM gcr.io/distroless/static-debian12
+WORKDIR /app
+COPY --from=builder /app/app .
+EXPOSE 8080
+ENTRYPOINT ["/app/app"]
+DOCKERFILE
+            ;;
+
+          python)
+            case "$BUILD_TOOL" in
+              poetry)
+                INSTALL_CMD="pip install poetry && poetry install --no-dev"
+                START_CMD='["poetry", "run", "python", "-m", "app"]'
+                ;;
+              *)
+                INSTALL_CMD="pip install --no-cache-dir -r requirements.txt"
+                START_CMD='["python", "-m", "app"]'
+                ;;
+            esac
+            case "$FRAMEWORK" in
+              django)   START_CMD='["python", "manage.py", "runserver", "0.0.0.0:8000"]'; PORT=8000 ;;
+              fastapi)  START_CMD='["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]'; PORT=8000 ;;
+              flask)    START_CMD='["flask", "run", "--host=0.0.0.0"]'; PORT=5000 ;;
+              *)        PORT=8000 ;;
+            esac
+            cat > "$SRC/Dockerfile" <<DOCKERFILE
+FROM python:3.12-slim
+WORKDIR /app
+COPY . .
+RUN $INSTALL_CMD
+EXPOSE $PORT
+CMD $START_CMD
+DOCKERFILE
+            ;;
+
+          php)
+            cat > "$SRC/Dockerfile" <<DOCKERFILE
+FROM php:8.3-fpm-alpine AS builder
+RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+WORKDIR /app
+COPY composer*.json ./
+RUN composer install --no-dev --optimize-autoloader
+COPY . .
+
+FROM php:8.3-fpm-alpine AS runner
+WORKDIR /app
+COPY --from=builder /app .
+EXPOSE 9000
+CMD ["php-fpm"]
+DOCKERFILE
+            ;;
+
+          rust)
+            cat > "$SRC/Dockerfile" <<DOCKERFILE
+FROM rust:1.77-alpine AS builder
+RUN apk add --no-cache musl-dev
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main(){}' > src/main.rs && cargo build --release && rm -f target/release/deps/app*
+COPY . .
+RUN cargo build --release
+
+FROM gcr.io/distroless/static-debian12
+COPY --from=builder /app/target/release/app /app
+EXPOSE 8080
+ENTRYPOINT ["/app"]
+DOCKERFILE
+            ;;
+
+          *)
+            echo "==> Cannot generate Dockerfile for unknown language '$LANGUAGE'"
+            echo "    Please add a Dockerfile to your repository."
+            exit 1
+            ;;
+        esac
+
+        echo "==> Generated Dockerfile:"
+        cat "$SRC/Dockerfile"
+
+    - name: kaniko-build-and-push
+      image: gcr.io/kaniko-project/executor:v1.23.0
+      args:
+        - --context=$(workspaces.source.path)/$(params.context)
+        - --dockerfile=$(workspaces.source.path)/$(params.dockerfile-path)
+        - --destination=$(params.image)
+        - --digest-file=$(results.image-digest.path)
+        - --skip-push=$(params.skip-push)
+        - --insecure=$(params.insecure-registry)
+        - --cache=true
+        - --cache-ttl=24h
+        - $(params.extra-build-args)
+      env:
+        - name: DOCKER_CONFIG
+          value: /kaniko/.docker
+      volumeMounts:
+        - name: docker-config
+          mountPath: /kaniko/.docker
+  volumes:
+    - name: docker-config
+      projected:
+        sources:
+          - secret:
+              name: docker-registry-credentials
+              items:
+                - key: .dockerconfigjson
+                  path: config.json
+              optional: true
+  stepTemplate:
+    computeResources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+      limits:
+        cpu: "2"
+        memory: 2Gi

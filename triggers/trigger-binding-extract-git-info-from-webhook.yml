@@ -1,0 +1,79 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: git-webhook-binding-github
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+    git-provider: github
+spec:
+  params:
+    - name: git-url
+      value: $(body.repository.clone_url)
+    - name: git-revision
+      value: $(body.ref)
+    - name: git-commit-sha
+      value: $(body.after)
+    - name: git-repo-name
+      value: $(body.repository.name)
+    - name: git-pusher
+      value: $(body.pusher.name)
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: git-webhook-binding-gitlab
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+    git-provider: gitlab
+spec:
+  params:
+    - name: git-url
+      value: $(body.project.http_url)
+    - name: git-revision
+      value: $(body.ref)
+    - name: git-commit-sha
+      value: $(body.checkout_sha)
+    - name: git-repo-name
+      value: $(body.project.name)
+    - name: git-pusher
+      value: $(body.user_username)
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: git-webhook-binding-bitbucket
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+    git-provider: bitbucket
+spec:
+  params:
+    - name: git-url
+      value: $(body.repository.links.html.href)
+    - name: git-revision
+      value: $(body.push.changes[0].new.name)
+    - name: git-commit-sha
+      value: $(body.push.changes[0].new.target.hash)
+    - name: git-repo-name
+      value: $(body.repository.name)
+    - name: git-pusher
+      value: $(body.actor.nickname)
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: git-webhook-binding-gitea
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+    git-provider: gitea
+spec:
+  params:
+    - name: git-url
+      value: $(body.repository.clone_url)
+    - name: git-revision
+      value: $(body.ref)
+    - name: git-commit-sha
+      value: $(body.after)
+    - name: git-repo-name
+      value: $(body.repository.name)
+    - name: git-pusher
+      value: $(body.pusher.login)

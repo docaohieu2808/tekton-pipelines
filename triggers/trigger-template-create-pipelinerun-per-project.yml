@@ -1,0 +1,191 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: auto-pipeline-trigger-template
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+spec:
+  description: |
+    Creates a PipelineRun for auto-pipeline on every webhook push event.
+    Projects register themselves by creating a Trigger that references this
+    TriggerTemplate and supplies project-specific params as resourcetemplates
+    overrides (image, deploy-target, etc.).
+  params:
+    # --- injected by TriggerBinding ---
+    - name: git-url
+      description: Repository clone URL
+    - name: git-revision
+      description: Git ref (e.g. refs/heads/main)
+      default: main
+    - name: git-commit-sha
+      description: Full commit SHA
+      default: ""
+    - name: git-repo-name
+      description: Short repository name (used in PipelineRun name)
+      default: app
+
+    # --- project-specific (set per Trigger) ---
+    - name: image
+      description: Full Docker image ref to build/push (registry/name:tag)
+      default: ""
+    - name: skip-docker-build
+      default: "false"
+    - name: skip-push
+      default: "false"
+    - name: skip-tests
+      default: "false"
+    - name: deploy-target
+      description: "ssh-build | docker-compose | k8s | helm | s3-cloudfront | rsync | skip"
+      default: "skip"
+
+    # --- deploy params (project-specific) ---
+    - name: ssh-host
+      default: ""
+    - name: ssh-user
+      default: "deploy"
+    - name: ssh-port
+      default: "22"
+    - name: remote-dir
+      default: "/opt/app"
+    - name: compose-file
+      default: "docker-compose.yml"
+    - name: compose-service
+      default: "app"
+    - name: k8s-namespace
+      default: "default"
+    - name: k8s-deployment
+      default: ""
+    - name: k8s-container
+      default: "app"
+    - name: k8s-manifests-path
+      default: ""
+    - name: helm-release
+      default: "myapp"
+    - name: helm-chart
+      default: "./chart"
+    - name: helm-namespace
+      default: "default"
+    - name: helm-values-file
+      default: "values.yaml"
+    - name: helm-extra-args
+      default: ""
+    - name: s3-bucket
+      default: ""
+    - name: s3-source-path
+      default: "dist"
+    - name: cloudfront-distribution-id
+      default: ""
+    - name: aws-region
+      default: "us-east-1"
+    - name: rsync-source-path
+      default: "."
+    - name: rsync-extra-args
+      default: "--exclude=.git --exclude=node_modules"
+
+    # --- workspace/volume config ---
+    - name: source-pvc
+      description: PVC name to use for the source workspace (must exist in namespace)
+      default: "pipeline-source-pvc"
+    - name: cache-pvc
+      description: PVC name for dependency cache (leave empty to skip)
+      default: ""
+    - name: docker-credentials-secret
+      description: Secret name containing .dockerconfigjson for image push
+      default: "docker-registry-credentials"
+    - name: ssh-credentials-secret
+      description: Secret name containing id_rsa SSH key for deploy
+      default: ""
+    - name: kubeconfig-secret
+      description: Secret name containing kubeconfig for k8s/helm deploy
+      default: ""
+    - name: aws-credentials-secret
+      description: Secret name containing AWS credentials for s3-cloudfront deploy
+      default: ""
+
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        # Unique name: <repo>-<short-sha>-<random>
+        generateName: $(tt.params.git-repo-name)-
+        labels:
+          app.kubernetes.io/part-of: auto-pipeline
+          git-repo: $(tt.params.git-repo-name)
+          git-sha: $(tt.params.git-commit-sha)
+        annotations:
+          git-url: $(tt.params.git-url)
+          git-revision: $(tt.params.git-revision)
+      spec:
+        pipelineRef:
+          name: auto-pipeline
+        params:
+          - name: git-url
+            value: $(tt.params.git-url)
+          - name: git-revision
+            value: $(tt.params.git-revision)
+          - name: git-commit-sha
+            value: $(tt.params.git-commit-sha)
+          - name: image
+            value: $(tt.params.image)
+          - name: skip-docker-build
+            value: $(tt.params.skip-docker-build)
+          - name: skip-push
+            value: $(tt.params.skip-push)
+          - name: skip-tests
+            value: $(tt.params.skip-tests)
+          - name: deploy-target
+            value: $(tt.params.deploy-target)
+          - name: ssh-host
+            value: $(tt.params.ssh-host)
+          - name: ssh-user
+            value: $(tt.params.ssh-user)
+          - name: ssh-port
+            value: $(tt.params.ssh-port)
+          - name: remote-dir
+            value: $(tt.params.remote-dir)
+          - name: compose-file
+            value: $(tt.params.compose-file)
+          - name: compose-service
+            value: $(tt.params.compose-service)
+          - name: k8s-namespace
+            value: $(tt.params.k8s-namespace)
+          - name: k8s-deployment
+            value: $(tt.params.k8s-deployment)
+          - name: k8s-container
+            value: $(tt.params.k8s-container)
+          - name: k8s-manifests-path
+            value: $(tt.params.k8s-manifests-path)
+          - name: helm-release
+            value: $(tt.params.helm-release)
+          - name: helm-chart
+            value: $(tt.params.helm-chart)
+          - name: helm-namespace
+            value: $(tt.params.helm-namespace)
+          - name: helm-values-file
+            value: $(tt.params.helm-values-file)
+          - name: helm-extra-args
+            value: $(tt.params.helm-extra-args)
+          - name: s3-bucket
+            value: $(tt.params.s3-bucket)
+          - name: s3-source-path
+            value: $(tt.params.s3-source-path)
+          - name: cloudfront-distribution-id
+            value: $(tt.params.cloudfront-distribution-id)
+          - name: aws-region
+            value: $(tt.params.aws-region)
+          - name: rsync-source-path
+            value: $(tt.params.rsync-source-path)
+          - name: rsync-extra-args
+            value: $(tt.params.rsync-extra-args)
+        workspaces:
+          - name: source
+            persistentVolumeClaim:
+              claimName: $(tt.params.source-pvc)
+          - name: docker-credentials
+            secret:
+              secretName: $(tt.params.docker-credentials-secret)
+          # cache, ssh, kubeconfig, aws are bound conditionally by project
+          # override in per-project Trigger if needed
+        timeouts:
+          pipeline: 1h
+          tasks: 50m

@@ -1,0 +1,326 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: deploy
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+spec:
+  description: |
+    Deploys the application to one of multiple targets:
+      - ssh-build:      SSH into server, pull image, rebuild
+      - docker-compose: SSH into server, run docker compose up
+      - k8s:            kubectl apply manifests or set image
+      - helm:           helm upgrade --install
+      - s3-cloudfront:  aws s3 sync + CloudFront invalidation
+      - rsync:          rsync files to remote server over SSH
+  params:
+    - name: deploy-target
+      description: "Deployment target: ssh-build | docker-compose | k8s | helm | s3-cloudfront | rsync"
+      type: string
+
+    - name: image
+      description: Full Docker image reference (used by ssh-build, docker-compose, k8s, helm)
+      type: string
+      default: ""
+
+    # --- SSH / rsync shared params ---
+    - name: ssh-host
+      description: SSH hostname or IP (used by ssh-build, docker-compose, rsync)
+      type: string
+      default: ""
+    - name: ssh-user
+      description: SSH username
+      type: string
+      default: "deploy"
+    - name: ssh-port
+      description: SSH port
+      type: string
+      default: "22"
+    - name: remote-dir
+      description: Remote working directory (used by ssh-build, docker-compose, rsync)
+      type: string
+      default: "/opt/app"
+
+    # --- docker-compose params ---
+    - name: compose-file
+      description: Path to docker-compose file on remote server
+      type: string
+      default: "docker-compose.yml"
+    - name: compose-service
+      description: Service name in docker-compose to update
+      type: string
+      default: "app"
+
+    # --- k8s params ---
+    - name: k8s-namespace
+      description: Kubernetes namespace to deploy into
+      type: string
+      default: "default"
+    - name: k8s-deployment
+      description: Kubernetes Deployment name to update image on (used when no manifests)
+      type: string
+      default: ""
+    - name: k8s-container
+      description: Container name inside the Deployment to update
+      type: string
+      default: "app"
+    - name: k8s-manifests-path
+      description: Path to k8s manifests directory within workspace (leave empty to use kubectl set image)
+      type: string
+      default: ""
+
+    # --- helm params ---
+    - name: helm-release
+      description: Helm release name
+      type: string
+      default: "myapp"
+    - name: helm-chart
+      description: Helm chart path or OCI ref (e.g. ./chart or oci://registry/chart)
+      type: string
+      default: "./chart"
+    - name: helm-namespace
+      description: Kubernetes namespace for helm release
+      type: string
+      default: "default"
+    - name: helm-values-file
+      description: Path to values file within workspace
+      type: string
+      default: "values.yaml"
+    - name: helm-extra-args
+      description: Additional arguments passed to helm upgrade
+      type: string
+      default: ""
+
+    # --- s3-cloudfront params ---
+    - name: s3-bucket
+      description: S3 bucket name (e.g. my-frontend-bucket)
+      type: string
+      default: ""
+    - name: s3-source-path
+      description: Local path within workspace to sync (e.g. dist or build)
+      type: string
+      default: "dist"
+    - name: cloudfront-distribution-id
+      description: CloudFront distribution ID for cache invalidation (leave empty to skip)
+      type: string
+      default: ""
+    - name: aws-region
+      description: AWS region
+      type: string
+      default: "us-east-1"
+
+    # --- rsync params ---
+    - name: rsync-source-path
+      description: Local path within workspace to sync
+      type: string
+      default: "."
+    - name: rsync-extra-args
+      description: Extra rsync arguments
+      type: string
+      default: "--exclude=.git --exclude=node_modules"
+
+  workspaces:
+    - name: source
+      description: Workspace with built application artifacts
+    - name: ssh-credentials
+      description: Workspace containing SSH private key at path id_rsa
+      optional: true
+    - name: kubeconfig
+      description: Workspace containing kubeconfig file at path config (for k8s/helm)
+      optional: true
+    - name: aws-credentials
+      description: Workspace containing AWS credentials file at path credentials (for s3-cloudfront)
+      optional: true
+
+  results:
+    - name: deploy-status
+      description: Status of the deployment (success/failure)
+    - name: deploy-url
+      description: URL of the deployed application (if detectable)
+
+  steps:
+    - name: setup-ssh
+      image: alpine:3.19
+      script: |
+        #!/bin/sh
+        TARGET="$(params.deploy-target)"
+        # Only configure SSH for targets that need it
+        case "$TARGET" in
+          ssh-build|docker-compose|rsync)
+            ;;
+          *)
+            echo "==> No SSH setup needed for target=$TARGET"
+            exit 0
+            ;;
+        esac
+
+        if [ "$(workspaces.ssh-credentials.bound)" != "true" ]; then
+          echo "ERROR: ssh-credentials workspace is required for target=$TARGET"
+          exit 1
+        fi
+
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+        cp "$(workspaces.ssh-credentials.path)/id_rsa" ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        # Disable strict host key checking for CI
+        cat > ~/.ssh/config <<EOF
+Host *
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  IdentityFile ~/.ssh/id_rsa
+EOF
+        chmod 600 ~/.ssh/config
+        echo "==> SSH configured for host $(params.ssh-host)"
+
+    - name: deploy
+      image: alpine:3.19
+      script: |
+        #!/bin/sh
+        set -e
+        SRC="$(workspaces.source.path)"
+        TARGET="$(params.deploy-target)"
+
+        echo "==> Deploying with target=$TARGET"
+
+        case "$TARGET" in
+
+          # ---------------------------------------------------------------
+          ssh-build)
+            apk add --no-cache openssh-client
+            SSH="ssh -p $(params.ssh-port) $(params.ssh-user)@$(params.ssh-host)"
+            $SSH "
+              set -e
+              cd $(params.remote-dir)
+              docker pull $(params.image)
+              docker stop app 2>/dev/null || true
+              docker rm app 2>/dev/null || true
+              docker run -d --name app --restart unless-stopped $(params.image)
+              echo 'Deploy complete'
+            "
+            printf "http://$(params.ssh-host)" > $(results.deploy-url.path)
+            ;;
+
+          # ---------------------------------------------------------------
+          docker-compose)
+            apk add --no-cache openssh-client
+            SSH="ssh -p $(params.ssh-port) $(params.ssh-user)@$(params.ssh-host)"
+            $SSH "
+              set -e
+              cd $(params.remote-dir)
+              export IMAGE=$(params.image)
+              docker compose -f $(params.compose-file) pull $(params.compose-service)
+              docker compose -f $(params.compose-file) up -d --no-deps $(params.compose-service)
+              docker compose -f $(params.compose-file) ps
+              echo 'docker-compose deploy complete'
+            "
+            printf "http://$(params.ssh-host)" > $(results.deploy-url.path)
+            ;;
+
+          # ---------------------------------------------------------------
+          k8s)
+            apk add --no-cache curl
+            curl -LO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
+            chmod +x kubectl && mv kubectl /usr/local/bin/
+
+            if [ "$(workspaces.kubeconfig.bound)" = "true" ]; then
+              export KUBECONFIG="$(workspaces.kubeconfig.path)/config"
+            fi
+
+            MANIFESTS="$(params.k8s-manifests-path)"
+            if [ -n "$MANIFESTS" ] && [ -d "$SRC/$MANIFESTS" ]; then
+              echo "==> Applying manifests from $SRC/$MANIFESTS"
+              kubectl apply -f "$SRC/$MANIFESTS" -n "$(params.k8s-namespace)"
+              kubectl rollout status deployment/"$(params.k8s-deployment)" \
+                -n "$(params.k8s-namespace)" --timeout=300s 2>/dev/null || true
+            else
+              echo "==> kubectl set image deployment/$(params.k8s-deployment)"
+              kubectl set image deployment/"$(params.k8s-deployment)" \
+                "$(params.k8s-container)=$(params.image)" \
+                -n "$(params.k8s-namespace)"
+              kubectl rollout status deployment/"$(params.k8s-deployment)" \
+                -n "$(params.k8s-namespace)" --timeout=300s
+            fi
+            printf "" > $(results.deploy-url.path)
+            ;;
+
+          # ---------------------------------------------------------------
+          helm)
+            apk add --no-cache curl
+            curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | sh
+
+            if [ "$(workspaces.kubeconfig.bound)" = "true" ]; then
+              export KUBECONFIG="$(workspaces.kubeconfig.path)/config"
+            fi
+
+            VALUES_FILE=""
+            if [ -f "$SRC/$(params.helm-values-file)" ]; then
+              VALUES_FILE="-f $SRC/$(params.helm-values-file)"
+            fi
+
+            helm upgrade --install "$(params.helm-release)" "$(params.helm-chart)" \
+              --namespace "$(params.helm-namespace)" \
+              --create-namespace \
+              --set image.repository="$(params.image)" \
+              $VALUES_FILE \
+              $(params.helm-extra-args)
+
+            kubectl rollout status deployment/"$(params.helm-release)" \
+              -n "$(params.helm-namespace)" --timeout=300s 2>/dev/null || true
+            printf "" > $(results.deploy-url.path)
+            ;;
+
+          # ---------------------------------------------------------------
+          s3-cloudfront)
+            apk add --no-cache aws-cli
+            if [ "$(workspaces.aws-credentials.bound)" = "true" ]; then
+              export AWS_SHARED_CREDENTIALS_FILE="$(workspaces.aws-credentials.path)/credentials"
+            fi
+            export AWS_DEFAULT_REGION="$(params.aws-region)"
+
+            echo "==> Syncing $SRC/$(params.s3-source-path) to s3://$(params.s3-bucket)"
+            aws s3 sync "$SRC/$(params.s3-source-path)" "s3://$(params.s3-bucket)" \
+              --delete \
+              --cache-control "public,max-age=31536000,immutable"
+
+            DIST_ID="$(params.cloudfront-distribution-id)"
+            if [ -n "$DIST_ID" ]; then
+              echo "==> Invalidating CloudFront distribution $DIST_ID"
+              aws cloudfront create-invalidation \
+                --distribution-id "$DIST_ID" \
+                --paths "/*"
+            fi
+            printf "https://$(params.s3-bucket).s3.amazonaws.com" > $(results.deploy-url.path)
+            ;;
+
+          # ---------------------------------------------------------------
+          rsync)
+            apk add --no-cache openssh-client rsync
+            REMOTE="$(params.ssh-user)@$(params.ssh-host):$(params.remote-dir)/"
+            rsync -avz --progress \
+              -e "ssh -p $(params.ssh-port)" \
+              $(params.rsync-extra-args) \
+              "$SRC/$(params.rsync-source-path)/" \
+              "$REMOTE"
+            printf "http://$(params.ssh-host)" > $(results.deploy-url.path)
+            ;;
+
+          *)
+            echo "ERROR: Unknown deploy-target '$(params.deploy-target)'"
+            echo "Valid values: ssh-build | docker-compose | k8s | helm | s3-cloudfront | rsync"
+            exit 1
+            ;;
+        esac
+
+        echo "==> Deployment complete"
+        printf 'success' > $(results.deploy-status.path)
+      env:
+        - name: HOME
+          value: /root
+      computeResources:
+        requests:
+          cpu: 200m
+          memory: 256Mi
+        limits:
+          cpu: "1"
+          memory: 512Mi

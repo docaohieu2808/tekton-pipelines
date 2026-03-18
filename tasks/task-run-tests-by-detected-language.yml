@@ -1,0 +1,193 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: run-tests
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+spec:
+  description: |
+    Runs the test suite using the language/build-tool detected by detect-language task.
+    Supports: node (npm/yarn/pnpm), java (maven/gradle), go, python (pip/poetry),
+    php (composer/phpunit), rust (cargo). Outputs test results as JUnit XML when possible.
+  params:
+    - name: language
+      description: Language detected by detect-language task
+      type: string
+    - name: build-tool
+      description: Build tool detected by detect-language task
+      type: string
+    - name: test-command
+      description: Test command detected by detect-language task (used as fallback)
+      type: string
+      default: ""
+    - name: extra-test-args
+      description: Additional arguments appended to the test command
+      type: string
+      default: ""
+    - name: skip-tests
+      description: Set to "true" to skip running tests
+      type: string
+      default: "false"
+  workspaces:
+    - name: source
+      description: Workspace with cloned and built source code
+    - name: test-results
+      description: Optional workspace to write JUnit XML results
+      optional: true
+  results:
+    - name: test-status
+      description: Status of the test run (success/skipped/failure)
+    - name: tests-passed
+      description: Number of tests passed (if detectable)
+    - name: tests-failed
+      description: Number of tests failed (if detectable)
+  steps:
+    - name: test
+      image: alpine:3.19
+      script: |
+        #!/bin/sh
+        set -e
+        SRC="$(workspaces.source.path)"
+        cd "$SRC"
+
+        LANGUAGE="$(params.language)"
+        BUILD_TOOL="$(params.build-tool)"
+        EXTRA="$(params.extra-test-args)"
+        SKIP="$(params.skip-tests)"
+        DETECTED_CMD="$(params.test-command)"
+
+        if [ "$SKIP" = "true" ]; then
+          echo "==> Tests skipped by param skip-tests=true"
+          printf 'skipped' > $(results.test-status.path)
+          printf '0'       > $(results.tests-passed.path)
+          printf '0'       > $(results.tests-failed.path)
+          exit 0
+        fi
+
+        RESULTS_DIR=""
+        if [ "$(workspaces.test-results.bound)" = "true" ]; then
+          RESULTS_DIR="$(workspaces.test-results.path)"
+        fi
+
+        echo "==> Running tests: language=$LANGUAGE build-tool=$BUILD_TOOL"
+
+        case "$LANGUAGE" in
+          node)
+            case "$BUILD_TOOL" in
+              pnpm)
+                npm install -g pnpm
+                pnpm install --frozen-lockfile
+                pnpm test $EXTRA
+                ;;
+              yarn)
+                npm install -g yarn
+                yarn install --frozen-lockfile
+                yarn test --passWithNoTests $EXTRA
+                ;;
+              *)
+                npm ci --prefer-offline || npm install
+                npm test -- --passWithNoTests $EXTRA
+                ;;
+            esac
+            ;;
+
+          java)
+            case "$BUILD_TOOL" in
+              gradle)
+                chmod +x ./gradlew 2>/dev/null || true
+                if [ -n "$RESULTS_DIR" ]; then
+                  ./gradlew test $EXTRA
+                  cp -r build/test-results/test/*.xml "$RESULTS_DIR/" 2>/dev/null || true
+                else
+                  ./gradlew test $EXTRA
+                fi
+                ;;
+              *)
+                if [ -n "$RESULTS_DIR" ]; then
+                  mvn test $EXTRA
+                  cp -r target/surefire-reports/*.xml "$RESULTS_DIR/" 2>/dev/null || true
+                else
+                  mvn test $EXTRA
+                fi
+                ;;
+            esac
+            ;;
+
+          go)
+            if [ -n "$RESULTS_DIR" ]; then
+              go install gotest.tools/gotestsum@latest 2>/dev/null || true
+              if command -v gotestsum >/dev/null 2>&1; then
+                gotestsum --junitfile "$RESULTS_DIR/results.xml" -- ./... $EXTRA
+              else
+                go test ./... $EXTRA
+              fi
+            else
+              go test -v ./... $EXTRA
+            fi
+            ;;
+
+          python)
+            case "$BUILD_TOOL" in
+              poetry)
+                pip install poetry
+                poetry install
+                if [ -n "$RESULTS_DIR" ]; then
+                  poetry run pytest --junitxml="$RESULTS_DIR/results.xml" $EXTRA
+                else
+                  poetry run pytest $EXTRA
+                fi
+                ;;
+              *)
+                pip install pytest
+                if [ -n "$RESULTS_DIR" ]; then
+                  python -m pytest --junitxml="$RESULTS_DIR/results.xml" $EXTRA
+                else
+                  python -m pytest $EXTRA
+                fi
+                ;;
+            esac
+            ;;
+
+          php)
+            composer install
+            if [ -f "vendor/bin/phpunit" ]; then
+              if [ -n "$RESULTS_DIR" ]; then
+                ./vendor/bin/phpunit --log-junit "$RESULTS_DIR/results.xml" $EXTRA
+              else
+                ./vendor/bin/phpunit $EXTRA
+              fi
+            else
+              echo "==> No phpunit found, skipping"
+            fi
+            ;;
+
+          rust)
+            cargo test $EXTRA
+            ;;
+
+          *)
+            if [ -n "$DETECTED_CMD" ]; then
+              echo "==> Running detected test command: $DETECTED_CMD"
+              sh -c "$DETECTED_CMD $EXTRA"
+            else
+              echo "==> Unknown language '$LANGUAGE', skipping tests"
+            fi
+            ;;
+        esac
+
+        echo "==> Tests complete"
+        printf 'success' > $(results.test-status.path)
+        printf '0'       > $(results.tests-passed.path)
+        printf '0'       > $(results.tests-failed.path)
+      env:
+        - name: GOPATH
+          value: /workspace/go
+        - name: GOCACHE
+          value: /workspace/go-cache
+      computeResources:
+        requests:
+          cpu: 500m
+          memory: 512Mi
+        limits:
+          cpu: "2"
+          memory: 2Gi

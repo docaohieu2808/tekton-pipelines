@@ -1,0 +1,320 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: auto-pipeline
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+spec:
+  description: |
+    Zero-config CI/CD pipeline that auto-detects language/framework and runs:
+    git-clone → detect-language → build → test → docker-build → deploy
+    Works with any Git provider (GitHub, GitLab, Bitbucket, Gitea).
+  params:
+    # --- Git params ---
+    - name: git-url
+      description: Git repository URL (https or ssh)
+      type: string
+    - name: git-revision
+      description: Git revision to checkout (branch, tag, commit SHA)
+      type: string
+      default: main
+    - name: git-commit-sha
+      description: Full commit SHA (injected by TriggerBinding)
+      type: string
+      default: ""
+
+    # --- Image params ---
+    - name: image
+      description: Full Docker image reference to build and push (registry/name:tag)
+      type: string
+    - name: skip-docker-build
+      description: Set to "true" to skip docker build step
+      type: string
+      default: "false"
+    - name: skip-push
+      description: Set to "true" to build image without pushing
+      type: string
+      default: "false"
+
+    # --- Test params ---
+    - name: skip-tests
+      description: Set to "true" to skip the test step
+      type: string
+      default: "false"
+
+    # --- Deploy params ---
+    - name: deploy-target
+      description: "Deploy target: ssh-build | docker-compose | k8s | helm | s3-cloudfront | rsync | skip"
+      type: string
+      default: "skip"
+    - name: ssh-host
+      type: string
+      default: ""
+    - name: ssh-user
+      type: string
+      default: "deploy"
+    - name: ssh-port
+      type: string
+      default: "22"
+    - name: remote-dir
+      type: string
+      default: "/opt/app"
+    - name: compose-file
+      type: string
+      default: "docker-compose.yml"
+    - name: compose-service
+      type: string
+      default: "app"
+    - name: k8s-namespace
+      type: string
+      default: "default"
+    - name: k8s-deployment
+      type: string
+      default: ""
+    - name: k8s-container
+      type: string
+      default: "app"
+    - name: k8s-manifests-path
+      type: string
+      default: ""
+    - name: helm-release
+      type: string
+      default: "myapp"
+    - name: helm-chart
+      type: string
+      default: "./chart"
+    - name: helm-namespace
+      type: string
+      default: "default"
+    - name: helm-values-file
+      type: string
+      default: "values.yaml"
+    - name: helm-extra-args
+      type: string
+      default: ""
+    - name: s3-bucket
+      type: string
+      default: ""
+    - name: s3-source-path
+      type: string
+      default: "dist"
+    - name: cloudfront-distribution-id
+      type: string
+      default: ""
+    - name: aws-region
+      type: string
+      default: "us-east-1"
+    - name: rsync-source-path
+      type: string
+      default: "."
+    - name: rsync-extra-args
+      type: string
+      default: "--exclude=.git --exclude=node_modules"
+
+  workspaces:
+    - name: source
+      description: Shared workspace for source code across all tasks
+    - name: cache
+      description: Optional dependency cache
+      optional: true
+    - name: test-results
+      description: Optional workspace to store JUnit XML test results
+      optional: true
+    - name: docker-credentials
+      description: Docker registry credentials (config.json)
+      optional: true
+    - name: ssh-credentials
+      description: SSH private key (id_rsa) for deploy targets
+      optional: true
+    - name: kubeconfig
+      description: kubeconfig file for k8s/helm deploy targets
+      optional: true
+    - name: aws-credentials
+      description: AWS credentials file for s3-cloudfront deploy target
+      optional: true
+
+  tasks:
+    # -----------------------------------------------------------------------
+    - name: git-clone
+      taskRef:
+        resolver: cluster
+        params:
+          - name: kind
+            value: task
+          - name: name
+            value: git-clone
+          - name: namespace
+            value: tekton-pipelines
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.git-revision)
+        - name: deleteExisting
+          value: "true"
+      workspaces:
+        - name: output
+          workspace: source
+
+    # -----------------------------------------------------------------------
+    - name: detect-language
+      taskRef:
+        name: detect-language
+      runAfter:
+        - git-clone
+      workspaces:
+        - name: source
+          workspace: source
+
+    # -----------------------------------------------------------------------
+    - name: build
+      taskRef:
+        name: build-application
+      runAfter:
+        - detect-language
+      params:
+        - name: language
+          value: $(tasks.detect-language.results.language)
+        - name: build-tool
+          value: $(tasks.detect-language.results.build-tool)
+        - name: build-command
+          value: $(tasks.detect-language.results.build-command)
+      workspaces:
+        - name: source
+          workspace: source
+        - name: cache
+          workspace: cache
+
+    # -----------------------------------------------------------------------
+    - name: test
+      taskRef:
+        name: run-tests
+      runAfter:
+        - build
+      params:
+        - name: language
+          value: $(tasks.detect-language.results.language)
+        - name: build-tool
+          value: $(tasks.detect-language.results.build-tool)
+        - name: test-command
+          value: $(tasks.detect-language.results.test-command)
+        - name: skip-tests
+          value: $(params.skip-tests)
+      workspaces:
+        - name: source
+          workspace: source
+        - name: test-results
+          workspace: test-results
+
+    # -----------------------------------------------------------------------
+    - name: docker-build
+      taskRef:
+        name: docker-build-kaniko
+      runAfter:
+        - test
+      when:
+        - input: $(params.skip-docker-build)
+          operator: in
+          values: ["false"]
+      params:
+        - name: image
+          value: $(params.image)
+        - name: language
+          value: $(tasks.detect-language.results.language)
+        - name: framework
+          value: $(tasks.detect-language.results.framework)
+        - name: build-tool
+          value: $(tasks.detect-language.results.build-tool)
+        - name: dockerfile-exists
+          value: $(tasks.detect-language.results.dockerfile-exists)
+        - name: skip-push
+          value: $(params.skip-push)
+      workspaces:
+        - name: source
+          workspace: source
+        - name: docker-credentials
+          workspace: docker-credentials
+
+    # -----------------------------------------------------------------------
+    - name: deploy
+      taskRef:
+        name: deploy
+      runAfter:
+        - docker-build
+      when:
+        - input: $(params.deploy-target)
+          operator: notin
+          values: ["skip", ""]
+      params:
+        - name: deploy-target
+          value: $(params.deploy-target)
+        - name: image
+          value: $(params.image)
+        - name: ssh-host
+          value: $(params.ssh-host)
+        - name: ssh-user
+          value: $(params.ssh-user)
+        - name: ssh-port
+          value: $(params.ssh-port)
+        - name: remote-dir
+          value: $(params.remote-dir)
+        - name: compose-file
+          value: $(params.compose-file)
+        - name: compose-service
+          value: $(params.compose-service)
+        - name: k8s-namespace
+          value: $(params.k8s-namespace)
+        - name: k8s-deployment
+          value: $(params.k8s-deployment)
+        - name: k8s-container
+          value: $(params.k8s-container)
+        - name: k8s-manifests-path
+          value: $(params.k8s-manifests-path)
+        - name: helm-release
+          value: $(params.helm-release)
+        - name: helm-chart
+          value: $(params.helm-chart)
+        - name: helm-namespace
+          value: $(params.helm-namespace)
+        - name: helm-values-file
+          value: $(params.helm-values-file)
+        - name: helm-extra-args
+          value: $(params.helm-extra-args)
+        - name: s3-bucket
+          value: $(params.s3-bucket)
+        - name: s3-source-path
+          value: $(params.s3-source-path)
+        - name: cloudfront-distribution-id
+          value: $(params.cloudfront-distribution-id)
+        - name: aws-region
+          value: $(params.aws-region)
+        - name: rsync-source-path
+          value: $(params.rsync-source-path)
+        - name: rsync-extra-args
+          value: $(params.rsync-extra-args)
+      workspaces:
+        - name: source
+          workspace: source
+        - name: ssh-credentials
+          workspace: ssh-credentials
+        - name: kubeconfig
+          workspace: kubeconfig
+        - name: aws-credentials
+          workspace: aws-credentials
+
+  results:
+    - name: language
+      description: Detected language
+      value: $(tasks.detect-language.results.language)
+    - name: framework
+      description: Detected framework
+      value: $(tasks.detect-language.results.framework)
+    - name: build-tool
+      description: Detected build tool
+      value: $(tasks.detect-language.results.build-tool)
+    - name: image-digest
+      description: Docker image digest
+      value: $(tasks.docker-build.results.image-digest)
+    - name: deploy-url
+      description: URL of the deployed application
+      value: $(tasks.deploy.results.deploy-url)
