@@ -164,12 +164,12 @@ spec:
         cp "$(workspaces.ssh-credentials.path)/id_rsa" ~/.ssh/id_rsa
         chmod 600 ~/.ssh/id_rsa
         # Disable strict host key checking for CI
-        cat > ~/.ssh/config <<EOF
-Host *
-  StrictHostKeyChecking no
-  UserKnownHostsFile /dev/null
-  IdentityFile ~/.ssh/id_rsa
-EOF
+        printf '%s\n' \
+          "Host *" \
+          "  StrictHostKeyChecking no" \
+          "  UserKnownHostsFile /dev/null" \
+          "  IdentityFile ~/.ssh/id_rsa" \
+          > ~/.ssh/config
         chmod 600 ~/.ssh/config
         echo "==> SSH configured for host $(params.ssh-host)"
 

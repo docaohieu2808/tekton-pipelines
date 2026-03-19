@@ -95,21 +95,21 @@ spec:
                 BUILD_CMD="npm run build"
                 ;;
             esac
-            cat > "$SRC/Dockerfile" <<DOCKERFILE
-FROM node:20-alpine AS builder
-WORKDIR /app
-COPY package*.json ./
-RUN $INSTALL_CMD
-COPY . .
-RUN $BUILD_CMD
-
-FROM node:20-alpine AS runner
-WORKDIR /app
-ENV NODE_ENV=production
-COPY --from=builder /app ./
-EXPOSE 3000
-CMD ["node", "dist/index.js"]
-DOCKERFILE
+            printf '%s\n' \
+              "FROM node:20-alpine AS builder" \
+              "WORKDIR /app" \
+              "COPY package*.json ./" \
+              "RUN $INSTALL_CMD" \
+              "COPY . ." \
+              "RUN $BUILD_CMD" \
+              "" \
+              "FROM node:20-alpine AS runner" \
+              "WORKDIR /app" \
+              "ENV NODE_ENV=production" \
+              "COPY --from=builder /app ./" \
+              "EXPOSE 3000" \
+              'CMD ["node", "dist/index.js"]' \
+              > "$SRC/Dockerfile"
             ;;
 
           java)
@@ -123,35 +123,35 @@ DOCKERFILE
                 ARTIFACT_PATH="target/*.jar"
                 ;;
             esac
-            cat > "$SRC/Dockerfile" <<DOCKERFILE
-FROM eclipse-temurin:21-jdk-alpine AS builder
-WORKDIR /app
-COPY . .
-RUN $BUILD_CMD
-
-FROM eclipse-temurin:21-jre-alpine AS runner
-WORKDIR /app
-COPY --from=builder /app/$ARTIFACT_PATH app.jar
-EXPOSE 8080
-ENTRYPOINT ["java", "-jar", "app.jar"]
-DOCKERFILE
+            printf '%s\n' \
+              "FROM eclipse-temurin:21-jdk-alpine AS builder" \
+              "WORKDIR /app" \
+              "COPY . ." \
+              "RUN $BUILD_CMD" \
+              "" \
+              "FROM eclipse-temurin:21-jre-alpine AS runner" \
+              "WORKDIR /app" \
+              "COPY --from=builder /app/$ARTIFACT_PATH app.jar" \
+              "EXPOSE 8080" \
+              'ENTRYPOINT ["java", "-jar", "app.jar"]' \
+              > "$SRC/Dockerfile"
             ;;
 
           go)
-            cat > "$SRC/Dockerfile" <<DOCKERFILE
-FROM golang:1.22-alpine AS builder
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o app ./...
-
-FROM gcr.io/distroless/static-debian12
-WORKDIR /app
-COPY --from=builder /app/app .
-EXPOSE 8080
-ENTRYPOINT ["/app/app"]
-DOCKERFILE
+            printf '%s\n' \
+              "FROM golang:1.22-alpine AS builder" \
+              "WORKDIR /app" \
+              "COPY go.mod go.sum ./" \
+              "RUN go mod download" \
+              "COPY . ." \
+              "RUN CGO_ENABLED=0 GOOS=linux go build -o app ./..." \
+              "" \
+              "FROM gcr.io/distroless/static-debian12" \
+              "WORKDIR /app" \
+              "COPY --from=builder /app/app ." \
+              "EXPOSE 8080" \
+              'ENTRYPOINT ["/app/app"]' \
+              > "$SRC/Dockerfile"
             ;;
 
           python)
@@ -171,48 +171,48 @@ DOCKERFILE
               flask)    START_CMD='["flask", "run", "--host=0.0.0.0"]'; PORT=5000 ;;
               *)        PORT=8000 ;;
             esac
-            cat > "$SRC/Dockerfile" <<DOCKERFILE
-FROM python:3.12-slim
-WORKDIR /app
-COPY . .
-RUN $INSTALL_CMD
-EXPOSE $PORT
-CMD $START_CMD
-DOCKERFILE
+            printf '%s\n' \
+              "FROM python:3.12-slim" \
+              "WORKDIR /app" \
+              "COPY . ." \
+              "RUN $INSTALL_CMD" \
+              "EXPOSE $PORT" \
+              "CMD $START_CMD" \
+              > "$SRC/Dockerfile"
             ;;
 
           php)
-            cat > "$SRC/Dockerfile" <<DOCKERFILE
-FROM php:8.3-fpm-alpine AS builder
-RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
-WORKDIR /app
-COPY composer*.json ./
-RUN composer install --no-dev --optimize-autoloader
-COPY . .
-
-FROM php:8.3-fpm-alpine AS runner
-WORKDIR /app
-COPY --from=builder /app .
-EXPOSE 9000
-CMD ["php-fpm"]
-DOCKERFILE
+            printf '%s\n' \
+              "FROM php:8.3-fpm-alpine AS builder" \
+              "RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer" \
+              "WORKDIR /app" \
+              "COPY composer*.json ./" \
+              "RUN composer install --no-dev --optimize-autoloader" \
+              "COPY . ." \
+              "" \
+              "FROM php:8.3-fpm-alpine AS runner" \
+              "WORKDIR /app" \
+              "COPY --from=builder /app ." \
+              "EXPOSE 9000" \
+              'CMD ["php-fpm"]' \
+              > "$SRC/Dockerfile"
             ;;
 
           rust)
-            cat > "$SRC/Dockerfile" <<DOCKERFILE
-FROM rust:1.77-alpine AS builder
-RUN apk add --no-cache musl-dev
-WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main(){}' > src/main.rs && cargo build --release && rm -f target/release/deps/app*
-COPY . .
-RUN cargo build --release
-
-FROM gcr.io/distroless/static-debian12
-COPY --from=builder /app/target/release/app /app
-EXPOSE 8080
-ENTRYPOINT ["/app"]
-DOCKERFILE
+            printf '%s\n' \
+              "FROM rust:1.77-alpine AS builder" \
+              "RUN apk add --no-cache musl-dev" \
+              "WORKDIR /app" \
+              "COPY Cargo.toml Cargo.lock ./" \
+              "RUN mkdir src && echo 'fn main(){}' > src/main.rs && cargo build --release && rm -f target/release/deps/app*" \
+              "COPY . ." \
+              "RUN cargo build --release" \
+              "" \
+              "FROM gcr.io/distroless/static-debian12" \
+              "COPY --from=builder /app/target/release/app /app" \
+              "EXPOSE 8080" \
+              'ENTRYPOINT ["/app"]' \
+              > "$SRC/Dockerfile"
             ;;
 
           *)
