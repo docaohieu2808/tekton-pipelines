@@ -1,0 +1,153 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: generate-sbom-with-syft
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+    app.kubernetes.io/version: "1.0"
+spec:
+  description: |
+    Generates a Software Bill of Materials (SBOM) using Anchore Syft.
+    Supports scanning a source directory or a container image.
+    Outputs SBOM in SPDX-JSON, CycloneDX-JSON, or Syft-JSON format.
+    The resulting SBOM file is written to the output workspace for downstream tasks.
+  params:
+    - name: scan-target
+      description: |
+        What to scan. Either:
+          - "dir:/workspace/source" to scan source directory
+          - "registry:image:tag"    to scan a container image
+          - a local image name from a prior docker-build step
+      type: string
+      default: "dir:/workspace/source"
+    - name: output-format
+      description: "SBOM output format: spdx-json | cyclonedx-json | syft-json"
+      type: string
+      default: "spdx-json"
+    - name: output-file
+      description: Filename for the generated SBOM (written to output workspace)
+      type: string
+      default: "sbom.spdx.json"
+    - name: syft-version
+      description: Anchore Syft image tag to use
+      type: string
+      default: "v1.4.1"
+    - name: registry-auth-config
+      description: |
+        Optional Docker config JSON for private registry auth (base64-encoded).
+        Leave empty when scanning public images or local source directories.
+      type: string
+      default: ""
+    - name: fail-on-error
+      description: "Fail the task if syft exits non-zero (true | false)"
+      type: string
+      default: "true"
+  workspaces:
+    - name: source
+      description: Workspace containing the cloned source code to scan
+      optional: true
+    - name: output
+      description: Workspace where the SBOM file is written
+  results:
+    - name: sbom-path
+      description: Absolute path to the generated SBOM file
+    - name: package-count
+      description: Number of packages/components found in the SBOM
+    - name: sbom-format
+      description: Format of the generated SBOM
+  steps:
+    - name: generate-sbom
+      image: anchore/syft:$(params.syft-version)
+      env:
+        - name: SYFT_CHECK_FOR_APP_UPDATE
+          value: "false"
+        - name: SYFT_LOG_LEVEL
+          value: "warn"
+      script: |
+        #!/bin/sh
+        set -e
+
+        SCAN_TARGET="$(params.scan-target)"
+        OUTPUT_FORMAT="$(params.output-format)"
+        OUTPUT_FILE="$(params.output-file)"
+        OUTPUT_DIR="$(workspaces.output.path)"
+        FAIL_ON_ERROR="$(params.fail-on-error)"
+        REGISTRY_AUTH="$(params.registry-auth-config)"
+        FULL_OUTPUT_PATH="${OUTPUT_DIR}/${OUTPUT_FILE}"
+
+        echo "==> Syft SBOM generation"
+        echo "    Target  : $SCAN_TARGET"
+        echo "    Format  : $OUTPUT_FORMAT"
+        echo "    Output  : $FULL_OUTPUT_PATH"
+
+        # ── Optional registry auth setup ────────────────────────────────────────
+        if [ -n "$REGISTRY_AUTH" ]; then
+          mkdir -p /root/.docker
+          echo "$REGISTRY_AUTH" | base64 -d > /root/.docker/config.json
+          echo "    Registry auth configured"
+        fi
+
+        # ── Run syft ────────────────────────────────────────────────────────────
+        set +e
+        syft "$SCAN_TARGET" \
+          --output "${OUTPUT_FORMAT}=${FULL_OUTPUT_PATH}" \
+          --quiet
+        SYFT_EXIT=$?
+        set -e
+
+        if [ "$SYFT_EXIT" -ne 0 ]; then
+          echo "ERROR: syft exited with code $SYFT_EXIT"
+          if [ "$FAIL_ON_ERROR" = "true" ]; then
+            exit "$SYFT_EXIT"
+          else
+            echo "WARNING: Continuing despite syft error (fail-on-error=false)"
+            printf '%s' "$FULL_OUTPUT_PATH" > $(results.sbom-path.path)
+            printf '0'                      > $(results.package-count.path)
+            printf '%s' "$OUTPUT_FORMAT"    > $(results.sbom-format.path)
+            exit 0
+          fi
+        fi
+
+        echo "==> SBOM generated successfully: $FULL_OUTPUT_PATH"
+
+        # ── Count packages depending on format ──────────────────────────────────
+        PKG_COUNT=0
+        if command -v jq >/dev/null 2>&1; then
+          case "$OUTPUT_FORMAT" in
+            spdx-json)
+              PKG_COUNT=$(jq '.packages | length' "$FULL_OUTPUT_PATH" 2>/dev/null || echo 0)
+              ;;
+            cyclonedx-json)
+              PKG_COUNT=$(jq '.components | length' "$FULL_OUTPUT_PATH" 2>/dev/null || echo 0)
+              ;;
+            syft-json)
+              PKG_COUNT=$(jq '.artifacts | length' "$FULL_OUTPUT_PATH" 2>/dev/null || echo 0)
+              ;;
+          esac
+        fi
+
+        echo "    Packages found: $PKG_COUNT"
+
+        # ── Write results ────────────────────────────────────────────────────────
+        printf '%s' "$FULL_OUTPUT_PATH" > $(results.sbom-path.path)
+        printf '%s' "$PKG_COUNT"        > $(results.package-count.path)
+        printf '%s' "$OUTPUT_FORMAT"    > $(results.sbom-format.path)
+
+    - name: print-sbom-summary
+      image: alpine:3.19
+      script: |
+        #!/bin/sh
+        OUTPUT_DIR="$(workspaces.output.path)"
+        OUTPUT_FILE="$(params.output-file)"
+        FULL_OUTPUT_PATH="${OUTPUT_DIR}/${OUTPUT_FILE}"
+
+        echo "==> SBOM Summary"
+        if [ -f "$FULL_OUTPUT_PATH" ]; then
+          FILE_SIZE=$(du -sh "$FULL_OUTPUT_PATH" | cut -f1)
+          echo "    File : $FULL_OUTPUT_PATH"
+          echo "    Size : $FILE_SIZE"
+          echo "    First 20 lines:"
+          head -20 "$FULL_OUTPUT_PATH"
+        else
+          echo "WARNING: SBOM file not found at $FULL_OUTPUT_PATH"
+        fi
