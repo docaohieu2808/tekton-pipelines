@@ -1,0 +1,89 @@
+# Tekton Level 6 — Tekton Chains Supply Chain Security Configuration
+# Enables SLSA provenance generation, cosign artifact signing, OCI attestation storage
+#
+# PREREQUISITES (install Chains first):
+#   kubectl apply -f https://storage.googleapis.com/tekton-releases/chains/latest/release.yaml
+#
+# SETUP STEPS:
+#   1. Install Chains (command above)
+#   2. Generate cosign keypair:
+#      cosign generate-key-pair k8s://tekton-chains/signing-secrets
+#      (stores keys as Secret "signing-secrets" in tekton-chains namespace)
+#   3. Replace {{PLACEHOLDER}} values below
+#   4. Apply this ConfigMap:
+#      kubectl apply -f tekton-chains-slsa-cosign-oci-storage-config.yaml
+#   5. Restart Chains controller:
+#      kubectl rollout restart deploy/tekton-chains-controller -n tekton-chains
+#   6. Verify: kubectl get configmap chains-config -n tekton-chains -o yaml
+#
+# VERIFY SIGNING IS WORKING (after a TaskRun completes):
+#   # Get a completed TaskRun name
+#   TR=$(kubectl get taskrun -o name | head -1)
+#   # Check for signed annotation
+#   kubectl get $TR -o jsonpath='{.metadata.annotations.chains\.tekton\.dev/signed}'
+#   # Should return: "true"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chains-config
+  namespace: tekton-chains
+  labels:
+    app.kubernetes.io/name: tekton-chains
+    app.kubernetes.io/component: chains-config
+    app.kubernetes.io/part-of: tekton-chains
+data:
+  # ── Artifact Storage ────────────────────────────────────────────────────────
+  # Where to store OCI image signatures and attestations
+  # Format: oci — pushes signatures/attestations as OCI artifacts alongside image
+  artifacts.oci.storage: "oci"
+
+  # OCI image artifact signing format
+  # simplesigning: single-layer signing (compatible with cosign verify)
+  artifacts.oci.format: "simplesigning"
+
+  # Signer for OCI image artifacts
+  artifacts.oci.signer: "x509"
+
+  # ── TaskRun Storage ─────────────────────────────────────────────────────────
+  # Store TaskRun-level provenance as OCI attestations
+  artifacts.taskrun.storage: "oci"
+
+  # SLSA provenance format for TaskRun attestations
+  # slsaprovenance: SLSA v0.2 (widely supported)
+  # slsaprovenance1: SLSA v1.0 (latest spec)
+  artifacts.taskrun.format: "slsaprovenance1"
+
+  # Signer for TaskRun attestations
+  artifacts.taskrun.signer: "x509"
+
+  # ── PipelineRun Storage ─────────────────────────────────────────────────────
+  artifacts.pipelinerun.storage: "oci"
+
+  # SLSA v1.0 provenance for full pipeline runs
+  artifacts.pipelinerun.format: "slsaprovenance1"
+
+  artifacts.pipelinerun.signer: "x509"
+
+  # ── Signing Backend ─────────────────────────────────────────────────────────
+  # x509: uses cosign keypair stored in Secret "signing-secrets"
+  # alternatives: kms (AWS KMS, GCP KMS), fulcio (keyless via OIDC)
+  signers.x509.fulcio.enabled: "false"
+
+  # ── Transparency Log ────────────────────────────────────────────────────────
+  # Rekor: public append-only transparency log for signatures
+  # Set to "true" to upload signatures to public Rekor instance
+  # Set to "false" for air-gapped / private deployments
+  transparency.enabled: "false"
+  # transparency.url: "https://rekor.sigstore.dev"
+
+  # ── Builder ID ──────────────────────────────────────────────────────────────
+  # Identifies this Tekton instance in SLSA provenance "builder.id" field
+  # Use a URL that uniquely identifies your CI system
+  builder.id: "https://{{TEKTON_HOSTNAME}}/tekton-chains"
+
+  # ── OCI Registry for Attestations ───────────────────────────────────────────
+  # Chains pushes attestations to the same registry as the image by default.
+  # To override with a dedicated attestation registry, set:
+  # storage.oci.repository: "{{OCI_REGISTRY_HOST}}/{{OCI_REGISTRY_NAMESPACE}}/attestations"
+  # Ensure the Chains controller SA has push access to this registry.

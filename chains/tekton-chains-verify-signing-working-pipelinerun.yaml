@@ -1,0 +1,114 @@
+# Tekton Level 6 — Tekton Chains Install & Verification Manifest
+#
+# STEP 1 — Install Tekton Chains:
+#   kubectl apply -f https://storage.googleapis.com/tekton-releases/chains/latest/release.yaml
+#
+# STEP 2 — Generate cosign keypair (stores into K8s Secret automatically):
+#   cosign generate-key-pair k8s://tekton-chains/signing-secrets
+#
+# STEP 3 — Apply chains config:
+#   kubectl apply -f tekton-chains-slsa-cosign-oci-storage-config.yaml
+#
+# STEP 4 — Apply this file to run the verification TaskRun + Pipeline:
+#   kubectl apply -f tekton-chains-verify-signing-working-pipelinerun.yaml
+#
+# STEP 5 — Watch execution:
+#   kubectl get pipelinerun -n tekton-chains -w
+#   kubectl get taskrun -n tekton-chains -w
+#
+# STEP 6 — Verify Chains signed the TaskRun:
+#   TR=$(kubectl get taskrun -n tekton-chains -l app.kubernetes.io/part-of=chains-verify -o name | head -1)
+#   kubectl get $TR -n tekton-chains -o jsonpath='{.metadata.annotations.chains\.tekton\.dev/signed}'
+#   # Expected output: true
+#
+# STEP 7 — Inspect SLSA provenance attestation:
+#   kubectl get $TR -n tekton-chains -o jsonpath='{.metadata.annotations}' | jq .
+---
+# ── Task: emit a result so Chains has something to sign ──────────────────────
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: chains-verify-emit-result
+  namespace: tekton-chains
+  labels:
+    app.kubernetes.io/name: chains-verify-emit-result
+    app.kubernetes.io/part-of: chains-verify
+spec:
+  description: |
+    Minimal task that writes a fake IMAGE_URL + IMAGE_DIGEST result.
+    Tekton Chains watches for these specific result names and signs them.
+    Used to verify that Chains is configured and signing correctly.
+  results:
+    - name: IMAGE_URL
+      description: OCI image reference that Chains will sign
+    - name: IMAGE_DIGEST
+      description: SHA256 digest of the image that Chains will attest
+  steps:
+    - name: emit-image-result
+      image: cgr.dev/chainguard/busybox:latest
+      script: |
+        #!/bin/sh
+        set -e
+        # Emit a well-known image reference so Chains produces a signature
+        printf 'ttl.sh/chains-verify-test:latest' | tee $(results.IMAGE_URL.path)
+        # Use a stable digest for the test image
+        printf 'sha256:a6cb4a456d1d6af9152b20a4e9fef4a7e8a74caf82ec6a9a4bfc69e0823dc72f' \
+          | tee $(results.IMAGE_DIGEST.path)
+        echo ""
+        echo "Chains verification task complete. Chains controller will now sign this result."
+---
+# ── Pipeline: wraps the verification task ────────────────────────────────────
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: chains-verify-signing-pipeline
+  namespace: tekton-chains
+  labels:
+    app.kubernetes.io/name: chains-verify-signing-pipeline
+    app.kubernetes.io/part-of: chains-verify
+spec:
+  description: |
+    Verification pipeline for Tekton Chains supply chain security setup.
+    Runs chains-verify-emit-result Task, then Chains should sign the TaskRun
+    and generate SLSA provenance attestation automatically.
+  tasks:
+    - name: emit-signable-result
+      taskRef:
+        name: chains-verify-emit-result
+        kind: Task
+  results:
+    - name: image-url
+      description: Image URL signed by Chains
+      value: $(tasks.emit-signable-result.results.IMAGE_URL)
+    - name: image-digest
+      description: Image digest attested by Chains
+      value: $(tasks.emit-signable-result.results.IMAGE_DIGEST)
+---
+# ── PipelineRun: trigger the verification pipeline ───────────────────────────
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: chains-verify-signing-run-001
+  namespace: tekton-chains
+  labels:
+    app.kubernetes.io/name: chains-verify-signing-run
+    app.kubernetes.io/part-of: chains-verify
+  annotations:
+    # After this PipelineRun completes, Chains should add these annotations:
+    #   chains.tekton.dev/signed: "true"
+    #   chains.tekton.dev/transparency: <rekor log URL> (if transparency enabled)
+    #   chains.tekton.dev/signature-*: base64-encoded cosign signature
+    #   chains.tekton.dev/payload-*: base64-encoded SLSA provenance payload
+    description: "Verification run — confirms Tekton Chains signing is operational"
+spec:
+  pipelineRef:
+    name: chains-verify-signing-pipeline
+  taskRunSpecs:
+    - pipelineTaskName: emit-signable-result
+      computeResources:
+        requests:
+          cpu: 100m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
