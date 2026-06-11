@@ -47,7 +47,9 @@ spec:
             - name: overlays
               value:
                 - key: git_revision
-                  expression: "body.ref.split('/')[2]"
+                  # body.ref = "refs/heads/feature/foo" — split('/')[2] yields only "feature".
+                  # replace() strips the prefix correctly for branch names with slashes.
+                  expression: "body.ref.replace('refs/heads/', '')"
       bindings:
         - ref: git-webhook-binding-github
       template:
@@ -80,7 +82,9 @@ spec:
             - name: overlays
               value:
                 - key: git_revision
-                  expression: "body.ref.split('/')[2]"
+                  # body.ref = "refs/heads/feature/foo" — split('/')[2] yields only "feature".
+                  # replace() strips the prefix correctly for branch names with slashes.
+                  expression: "body.ref.replace('refs/heads/', '')"
       bindings:
         - ref: git-webhook-binding-gitlab
       template:
@@ -134,7 +138,9 @@ spec:
             - name: overlays
               value:
                 - key: git_revision
-                  expression: "body.ref.split('/')[2]"
+                  # body.ref = "refs/heads/feature/foo" — split('/')[2] yields only "feature".
+                  # replace() strips the prefix correctly for branch names with slashes.
+                  expression: "body.ref.replace('refs/heads/', '')"
       bindings:
         - ref: git-webhook-binding-gitea
       template:
