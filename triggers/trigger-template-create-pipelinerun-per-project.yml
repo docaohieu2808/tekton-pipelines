@@ -1,3 +1,6 @@
+# Creates a PipelineRun for auto-pipeline on every webhook push event.
+# Projects register themselves by creating a Trigger that references this
+# TriggerTemplate and supplies project-specific params (image, deploy-target, etc.).
 apiVersion: triggers.tekton.dev/v1beta1
 kind: TriggerTemplate
 metadata:
@@ -5,10 +8,6 @@ metadata:
   labels:
     app.kubernetes.io/part-of: auto-pipeline
 spec:
-  description: |
-    Creates a PipelineRun for auto-pipeline on every webhook push event.
-    Projects register themselves by creating a Trigger that references this
-    TriggerTemplate and supplies project-specific params (image, deploy-target, etc.).
   params:
     # --- injected by TriggerBinding ---
     - name: git-url
