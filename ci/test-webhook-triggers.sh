@@ -73,7 +73,7 @@ post 1 "gitea push with a valid signature starts a PipelineRun" \
   -H "X-Hub-Signature-256: sha256=$(hmac "$gitea_secret" "$github_body")" --data "$github_body"
 
 # Cancel the runs of the gitlab and gitea pushes, then wait for the github and bitbucket runs.
-mapfile -t runs < <(kubectl get pipelinerun -n "$NS" -l tekton.dev/pipeline=auto-pipeline \
+mapfile -t runs < <(kubectl get pipelinerun -n "$NS" -l 'git-repo in (fixture-hook,fixture-bb)' \
   --sort-by=.metadata.creationTimestamp -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
 [ "${#runs[@]}" -eq 4 ] || { echo "FAIL: expected 4 PipelineRuns, found ${#runs[@]}" >&2; exit 1; }
 for i in 2 3; do
