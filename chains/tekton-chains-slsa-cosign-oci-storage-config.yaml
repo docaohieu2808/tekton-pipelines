@@ -7,9 +7,12 @@
 #        COSIGN_PASSWORD='' cosign generate-key-pair k8s://tekton-chains/signing-secrets
 #      It creates Secret signing-secrets (cosign.key, cosign.pub, cosign.password).
 #      Use a real password and keep cosign.pub for verification in production.
-#   3. Apply this ConfigMap:
+#   3. Restart the controller so it picks up the key. Without this it logs
+#      "no valid private key found" and signs nothing, while still marking runs as signed:
+#        kubectl rollout restart deployment/tekton-chains-controller -n tekton-chains
+#   4. Apply this ConfigMap:
 #        kubectl apply -f chains/tekton-chains-slsa-cosign-oci-storage-config.yaml
-#      The controller watches the ConfigMap; no restart is needed.
+#      The controller watches the ConfigMap; no restart is needed for config changes.
 #
 # WHAT GETS SIGNED
 #   Chains looks for TaskRun/PipelineRun results named IMAGE_URL and IMAGE_DIGEST

@@ -53,6 +53,8 @@ kubectl create namespace tekton-ci
 
 # L4 signing key (use a real password outside a lab) and config
 COSIGN_PASSWORD='' cosign generate-key-pair k8s://tekton-chains/signing-secrets
+kubectl rollout restart deployment/tekton-chains-controller -n tekton-chains   # load the new key
+kubectl rollout status deployment/tekton-chains-controller -n tekton-chains
 kubectl apply -f chains/
 
 # L1 + L2

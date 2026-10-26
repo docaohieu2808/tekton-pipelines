@@ -13,6 +13,10 @@ kubectl rollout status deployment/git-server -n git --timeout=180s
 
 # Chains signing key. Empty password only because this is a throw-away CI cluster.
 COSIGN_PASSWORD='' cosign generate-key-pair k8s://tekton-chains/signing-secrets
+# The controller reads the key from a mounted Secret at startup. Restart it so it has the new
+# key before the first run; otherwise it logs "no valid private key found" and signs nothing.
+kubectl rollout restart deployment/tekton-chains-controller -n tekton-chains
+kubectl rollout status deployment/tekton-chains-controller -n tekton-chains --timeout=180s
 kubectl apply -f chains/
 # The CI registry speaks plain HTTP; production keeps the default (false).
 kubectl patch configmap chains-config -n tekton-chains --type merge \
