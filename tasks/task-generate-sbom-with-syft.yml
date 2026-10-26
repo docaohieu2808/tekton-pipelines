@@ -1,0 +1,110 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: generate-sbom-with-syft
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+    app.kubernetes.io/version: "1.0"
+spec:
+  description: |
+    Generates a Software Bill of Materials (SBOM) with Anchore Syft.
+    Scans a source directory or a container image in a registry and writes the SBOM
+    (SPDX-JSON, CycloneDX-JSON or Syft-JSON) into the output workspace, where later
+    tasks (or a PersistentVolume you archive) can pick it up.
+    Uses the "-debug" Syft image because the default one is distroless and has no
+    /bin/sh to run the step script.
+  params:
+    - name: scan-target
+      description: |
+        What to scan. Either "dir:<path inside the workspace>" for source, or
+        "registry:<image ref>" (for example registry:host/app:tag@sha256:...) for an image.
+      type: string
+    - name: output-format
+      description: "SBOM output format: spdx-json | cyclonedx-json | syft-json"
+      type: string
+      default: "spdx-json"
+    - name: output-file
+      description: Filename for the generated SBOM (written to the output workspace)
+      type: string
+      default: "sbom.spdx.json"
+    - name: insecure-registry
+      description: Set to "true" to talk plain HTTP to the registry (local test registries only)
+      type: string
+      default: "false"
+    - name: syft-image
+      description: Syft image, pinned. Must be a "-debug" tag (needs a shell).
+      type: string
+      default: "anchore/syft:v1.55.0-debug"
+  workspaces:
+    - name: output
+      description: Workspace where the SBOM file is written
+    - name: registry-credentials
+      description: Optional workspace holding a Docker config.json (key "config.json") for private registries
+      optional: true
+  results:
+    - name: sbom-path
+      description: Absolute path to the generated SBOM file
+    - name: package-count
+      description: Number of packages/components found in the SBOM
+    - name: sbom-format
+      description: Format of the generated SBOM
+  steps:
+    - name: generate-sbom
+      image: $(params.syft-image)
+      env:
+        - name: SCAN_TARGET
+          value: $(params.scan-target)
+        - name: OUTPUT_FORMAT
+          value: $(params.output-format)
+        - name: OUTPUT_PATH
+          value: $(workspaces.output.path)/$(params.output-file)
+        - name: INSECURE
+          value: $(params.insecure-registry)
+        - name: CREDS_BOUND
+          value: $(workspaces.registry-credentials.bound)
+        - name: CREDS_DIR
+          value: $(workspaces.registry-credentials.path)
+        - name: SYFT_CHECK_FOR_APP_UPDATE
+          value: "false"
+      script: |
+        #!/bin/sh
+        set -eu
+
+        echo "==> Syft SBOM generation"
+        echo "    Target : $SCAN_TARGET"
+        echo "    Format : $OUTPUT_FORMAT"
+        echo "    Output : $OUTPUT_PATH"
+
+        if [ "$INSECURE" = "true" ]; then
+          export SYFT_REGISTRY_INSECURE_USE_HTTP=true
+        fi
+        if [ "$CREDS_BOUND" = "true" ] && [ -f "$CREDS_DIR/config.json" ]; then
+          export DOCKER_CONFIG="$CREDS_DIR"
+        fi
+
+        syft scan "$SCAN_TARGET" --output "${OUTPUT_FORMAT}=${OUTPUT_PATH}"
+        echo "==> SBOM written to $OUTPUT_PATH"
+
+    - name: summarize-sbom
+      image: alpine:3.24.3
+      env:
+        - name: OUTPUT_FORMAT
+          value: $(params.output-format)
+        - name: OUTPUT_PATH
+          value: $(workspaces.output.path)/$(params.output-file)
+      script: |
+        #!/bin/sh
+        set -eu
+        apk add --no-cache jq >/dev/null
+
+        case "$OUTPUT_FORMAT" in
+          spdx-json)      COUNT=$(jq '.packages | length' "$OUTPUT_PATH") ;;
+          cyclonedx-json) COUNT=$(jq '.components | length' "$OUTPUT_PATH") ;;
+          syft-json)      COUNT=$(jq '.artifacts | length' "$OUTPUT_PATH") ;;
+          *) echo "ERROR: unsupported format $OUTPUT_FORMAT" >&2; exit 1 ;;
+        esac
+
+        echo "==> SBOM summary: $OUTPUT_PATH ($(du -h "$OUTPUT_PATH" | cut -f1)), $COUNT packages"
+        printf '%s' "$OUTPUT_PATH"   > "$(results.sbom-path.path)"
+        printf '%s' "$COUNT"         > "$(results.package-count.path)"
+        printf '%s' "$OUTPUT_FORMAT" > "$(results.sbom-format.path)"

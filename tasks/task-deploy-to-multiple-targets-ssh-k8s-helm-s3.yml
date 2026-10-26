@@ -123,10 +123,13 @@ spec:
     - name: source
       description: Workspace with built application artifacts
     - name: ssh-credentials
-      description: Workspace containing SSH private key at path id_rsa
+      description: |
+        Workspace with the SSH private key (file id_rsa) and the pinned server host key
+        (file known_hosts, e.g. the output of ssh-keyscan checked by a human). Required for
+        ssh-build, docker-compose and rsync. Host keys are always verified.
       optional: true
     - name: kubeconfig
-      description: Workspace containing kubeconfig file at path config (for k8s/helm)
+      description: Workspace containing kubeconfig file at path config (for k8s/helm). Without it the in-cluster ServiceAccount is used.
       optional: true
     - name: aws-credentials
       description: Workspace containing AWS credentials file at path credentials (for s3-cloudfront)
@@ -134,189 +137,220 @@ spec:
 
   results:
     - name: deploy-status
-      description: Status of the deployment (success/failure)
+      description: Status of the deployment (success; a failed deploy fails the Task)
     - name: deploy-url
       description: URL of the deployed application (if detectable)
 
   steps:
-    - name: setup-ssh
-      image: alpine:3.19
-      script: |
-        #!/bin/sh
-        TARGET="$(params.deploy-target)"
-        # Only configure SSH for targets that need it
-        case "$TARGET" in
-          ssh-build|docker-compose|rsync)
-            ;;
-          *)
-            echo "==> No SSH setup needed for target=$TARGET"
-            exit 0
-            ;;
-        esac
-
-        if [ "$(workspaces.ssh-credentials.bound)" != "true" ]; then
-          echo "ERROR: ssh-credentials workspace is required for target=$TARGET"
-          exit 1
-        fi
-
-        mkdir -p ~/.ssh
-        chmod 700 ~/.ssh
-        cp "$(workspaces.ssh-credentials.path)/id_rsa" ~/.ssh/id_rsa
-        chmod 600 ~/.ssh/id_rsa
-        # Disable strict host key checking for CI
-        printf '%s\n' \
-          "Host *" \
-          "  StrictHostKeyChecking no" \
-          "  UserKnownHostsFile /dev/null" \
-          "  IdentityFile ~/.ssh/id_rsa" \
-          > ~/.ssh/config
-        chmod 600 ~/.ssh/config
-        echo "==> SSH configured for host $(params.ssh-host)"
-
     - name: deploy
-      image: alpine:3.19
+      image: alpine:3.24.3
+      workingDir: $(workspaces.source.path)
+      # All params reach the script through env, never by text substitution, so a
+      # value coming from a webhook cannot inject shell code.
+      env:
+        - name: TARGET
+          value: $(params.deploy-target)
+        - name: IMAGE
+          value: $(params.image)
+        - name: SSH_HOST
+          value: $(params.ssh-host)
+        - name: SSH_USER
+          value: $(params.ssh-user)
+        - name: SSH_PORT
+          value: $(params.ssh-port)
+        - name: REMOTE_DIR
+          value: $(params.remote-dir)
+        - name: COMPOSE_FILE
+          value: $(params.compose-file)
+        - name: COMPOSE_SERVICE
+          value: $(params.compose-service)
+        - name: K8S_NAMESPACE
+          value: $(params.k8s-namespace)
+        - name: K8S_DEPLOYMENT
+          value: $(params.k8s-deployment)
+        - name: K8S_CONTAINER
+          value: $(params.k8s-container)
+        - name: K8S_MANIFESTS_PATH
+          value: $(params.k8s-manifests-path)
+        - name: HELM_RELEASE
+          value: $(params.helm-release)
+        - name: HELM_CHART
+          value: $(params.helm-chart)
+        - name: HELM_NAMESPACE
+          value: $(params.helm-namespace)
+        - name: HELM_VALUES_FILE
+          value: $(params.helm-values-file)
+        - name: HELM_EXTRA_ARGS
+          value: $(params.helm-extra-args)
+        - name: S3_BUCKET
+          value: $(params.s3-bucket)
+        - name: S3_SOURCE_PATH
+          value: $(params.s3-source-path)
+        - name: CLOUDFRONT_DISTRIBUTION_ID
+          value: $(params.cloudfront-distribution-id)
+        - name: AWS_REGION
+          value: $(params.aws-region)
+        - name: RSYNC_SOURCE_PATH
+          value: $(params.rsync-source-path)
+        - name: RSYNC_EXTRA_ARGS
+          value: $(params.rsync-extra-args)
+        - name: SSH_BOUND
+          value: $(workspaces.ssh-credentials.bound)
+        - name: SSH_DIR
+          value: $(workspaces.ssh-credentials.path)
+        - name: KUBECONFIG_BOUND
+          value: $(workspaces.kubeconfig.bound)
+        - name: KUBECONFIG_DIR
+          value: $(workspaces.kubeconfig.path)
+        - name: AWS_BOUND
+          value: $(workspaces.aws-credentials.bound)
+        - name: AWS_DIR
+          value: $(workspaces.aws-credentials.path)
+        - name: HOME
+          value: /tmp/deploy-home
       script: |
         #!/bin/sh
-        set -e
-        SRC="$(workspaces.source.path)"
-        TARGET="$(params.deploy-target)"
+        set -eu
+
+        SRC=$(pwd)
+        mkdir -p "$HOME"
+
+        # Reject anything but plain identifiers/paths/refs in values that end up inside a
+        # remote shell command. $2=1 also allows spaces (for argument lists).
+        safe() {
+          case "$2" in
+            *[!A-Za-z0-9._/:@=+,-]*)
+              if [ "${3:-0}" = "1" ]; then
+                case "$2" in *[!A-Za-z0-9._/:@=+,\ -]*) echo "ERROR: unsafe characters in $1" >&2; exit 1 ;; esac
+              else
+                echo "ERROR: unsafe characters in $1" >&2; exit 1
+              fi
+              ;;
+          esac
+        }
+        safe image "$IMAGE"
+        safe ssh-host "$SSH_HOST"
+        safe ssh-user "$SSH_USER"
+        safe ssh-port "$SSH_PORT"
+        safe remote-dir "$REMOTE_DIR"
+        safe compose-file "$COMPOSE_FILE"
+        safe compose-service "$COMPOSE_SERVICE"
+        safe helm-extra-args "$HELM_EXTRA_ARGS" 1
+        safe rsync-extra-args "$RSYNC_EXTRA_ARGS" 1
+
+        # Sets up ssh with a pinned host key. Fails when the workspace or known_hosts is missing.
+        ssh_setup() {
+          if [ "$SSH_BOUND" != "true" ] || [ ! -f "$SSH_DIR/id_rsa" ] || [ ! -f "$SSH_DIR/known_hosts" ]; then
+            echo "ERROR: ssh-credentials workspace needs id_rsa and known_hosts for target=$TARGET" >&2
+            exit 1
+          fi
+          apk add --no-cache openssh-client >/dev/null
+          mkdir -p "$HOME/.ssh"
+          cp "$SSH_DIR/id_rsa" "$HOME/.ssh/id_rsa"
+          cp "$SSH_DIR/known_hosts" "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/id_rsa"
+          SSH_OPTS="-p $SSH_PORT -i $HOME/.ssh/id_rsa -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+        }
+
+        use_kubeconfig() {
+          if [ "$KUBECONFIG_BOUND" = "true" ]; then
+            export KUBECONFIG="$KUBECONFIG_DIR/config"
+          fi
+        }
 
         echo "==> Deploying with target=$TARGET"
 
         case "$TARGET" in
 
-          # ---------------------------------------------------------------
           ssh-build)
-            apk add --no-cache openssh-client
-            SSH="ssh -p $(params.ssh-port) $(params.ssh-user)@$(params.ssh-host)"
-            $SSH "
-              set -e
-              cd $(params.remote-dir)
-              docker pull $(params.image)
-              docker stop app 2>/dev/null || true
-              docker rm app 2>/dev/null || true
-              docker run -d --name app --restart unless-stopped $(params.image)
-              echo 'Deploy complete'
-            "
-            printf "http://$(params.ssh-host)" > $(results.deploy-url.path)
+            ssh_setup
+            # Values are validated by safe(); expanding them on the client side is intended.
+            # shellcheck disable=SC2086,SC2029
+            ssh $SSH_OPTS "$SSH_USER@$SSH_HOST" \
+              "set -e; cd $REMOTE_DIR; docker pull $IMAGE; docker rm -f app >/dev/null 2>&1 || true; docker run -d --name app --restart unless-stopped $IMAGE"
+            URL="http://$SSH_HOST"
             ;;
 
-          # ---------------------------------------------------------------
           docker-compose)
-            apk add --no-cache openssh-client
-            SSH="ssh -p $(params.ssh-port) $(params.ssh-user)@$(params.ssh-host)"
-            $SSH "
-              set -e
-              cd $(params.remote-dir)
-              export IMAGE=$(params.image)
-              docker compose -f $(params.compose-file) pull $(params.compose-service)
-              docker compose -f $(params.compose-file) up -d --no-deps $(params.compose-service)
-              docker compose -f $(params.compose-file) ps
-              echo 'docker-compose deploy complete'
-            "
-            printf "http://$(params.ssh-host)" > $(results.deploy-url.path)
+            ssh_setup
+            # Values are validated by safe(); expanding them on the client side is intended.
+            # shellcheck disable=SC2086,SC2029
+            ssh $SSH_OPTS "$SSH_USER@$SSH_HOST" \
+              "set -e; cd $REMOTE_DIR; export IMAGE=$IMAGE; docker compose -f $COMPOSE_FILE pull $COMPOSE_SERVICE; docker compose -f $COMPOSE_FILE up -d --no-deps $COMPOSE_SERVICE; docker compose -f $COMPOSE_FILE ps"
+            URL="http://$SSH_HOST"
             ;;
 
-          # ---------------------------------------------------------------
           k8s)
-            apk add --no-cache curl
-            curl -LO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
-            chmod +x kubectl && mv kubectl /usr/local/bin/
-
-            if [ "$(workspaces.kubeconfig.bound)" = "true" ]; then
-              export KUBECONFIG="$(workspaces.kubeconfig.path)/config"
-            fi
-
-            MANIFESTS="$(params.k8s-manifests-path)"
-            if [ -n "$MANIFESTS" ] && [ -d "$SRC/$MANIFESTS" ]; then
-              echo "==> Applying manifests from $SRC/$MANIFESTS"
-              kubectl apply -f "$SRC/$MANIFESTS" -n "$(params.k8s-namespace)"
-              kubectl rollout status deployment/"$(params.k8s-deployment)" \
-                -n "$(params.k8s-namespace)" --timeout=300s 2>/dev/null || true
+            apk add --no-cache kubectl >/dev/null
+            use_kubeconfig
+            if [ -n "$K8S_MANIFESTS_PATH" ] && [ -d "$SRC/$K8S_MANIFESTS_PATH" ]; then
+              echo "==> Applying manifests from $SRC/$K8S_MANIFESTS_PATH"
+              kubectl apply -f "$SRC/$K8S_MANIFESTS_PATH" -n "$K8S_NAMESPACE"
             else
-              echo "==> kubectl set image deployment/$(params.k8s-deployment)"
-              kubectl set image deployment/"$(params.k8s-deployment)" \
-                "$(params.k8s-container)=$(params.image)" \
-                -n "$(params.k8s-namespace)"
-              kubectl rollout status deployment/"$(params.k8s-deployment)" \
-                -n "$(params.k8s-namespace)" --timeout=300s
+              echo "==> kubectl set image deployment/$K8S_DEPLOYMENT"
+              kubectl set image "deployment/$K8S_DEPLOYMENT" "$K8S_CONTAINER=$IMAGE" -n "$K8S_NAMESPACE"
             fi
-            printf "" > $(results.deploy-url.path)
+            if [ -n "$K8S_DEPLOYMENT" ]; then
+              kubectl rollout status "deployment/$K8S_DEPLOYMENT" -n "$K8S_NAMESPACE" --timeout=300s
+            fi
+            URL=""
             ;;
 
-          # ---------------------------------------------------------------
           helm)
-            apk add --no-cache curl
-            curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | sh
-
-            if [ "$(workspaces.kubeconfig.bound)" = "true" ]; then
-              export KUBECONFIG="$(workspaces.kubeconfig.path)/config"
+            apk add --no-cache helm >/dev/null
+            use_kubeconfig
+            case "${IMAGE##*/}" in
+              *:*) REPO="${IMAGE%:*}"; TAG="${IMAGE##*:}" ;;
+              *)   REPO="$IMAGE"; TAG="latest" ;;
+            esac
+            set -- --set "image.repository=$REPO" --set "image.tag=$TAG"
+            if [ -f "$SRC/$HELM_VALUES_FILE" ]; then
+              set -- "$@" -f "$SRC/$HELM_VALUES_FILE"
             fi
-
-            VALUES_FILE=""
-            if [ -f "$SRC/$(params.helm-values-file)" ]; then
-              VALUES_FILE="-f $SRC/$(params.helm-values-file)"
-            fi
-
-            helm upgrade --install "$(params.helm-release)" "$(params.helm-chart)" \
-              --namespace "$(params.helm-namespace)" \
-              --create-namespace \
-              --set image.repository="$(params.image)" \
-              $VALUES_FILE \
-              $(params.helm-extra-args)
-
-            kubectl rollout status deployment/"$(params.helm-release)" \
-              -n "$(params.helm-namespace)" --timeout=300s 2>/dev/null || true
-            printf "" > $(results.deploy-url.path)
+            # $HELM_EXTRA_ARGS is a validated, space separated list of extra flags.
+            # shellcheck disable=SC2086
+            helm upgrade --install "$HELM_RELEASE" "$HELM_CHART" \
+              --namespace "$HELM_NAMESPACE" --create-namespace \
+              --wait --timeout 5m "$@" $HELM_EXTRA_ARGS
+            URL=""
             ;;
 
-          # ---------------------------------------------------------------
           s3-cloudfront)
-            apk add --no-cache aws-cli
-            if [ "$(workspaces.aws-credentials.bound)" = "true" ]; then
-              export AWS_SHARED_CREDENTIALS_FILE="$(workspaces.aws-credentials.path)/credentials"
+            apk add --no-cache aws-cli >/dev/null
+            if [ "$AWS_BOUND" = "true" ]; then
+              export AWS_SHARED_CREDENTIALS_FILE="$AWS_DIR/credentials"
             fi
-            export AWS_DEFAULT_REGION="$(params.aws-region)"
-
-            echo "==> Syncing $SRC/$(params.s3-source-path) to s3://$(params.s3-bucket)"
-            aws s3 sync "$SRC/$(params.s3-source-path)" "s3://$(params.s3-bucket)" \
-              --delete \
+            export AWS_DEFAULT_REGION="$AWS_REGION"
+            echo "==> Syncing $SRC/$S3_SOURCE_PATH to s3://$S3_BUCKET"
+            aws s3 sync "$SRC/$S3_SOURCE_PATH" "s3://$S3_BUCKET" --delete \
               --cache-control "public,max-age=31536000,immutable"
-
-            DIST_ID="$(params.cloudfront-distribution-id)"
-            if [ -n "$DIST_ID" ]; then
-              echo "==> Invalidating CloudFront distribution $DIST_ID"
-              aws cloudfront create-invalidation \
-                --distribution-id "$DIST_ID" \
-                --paths "/*"
+            if [ -n "$CLOUDFRONT_DISTRIBUTION_ID" ]; then
+              echo "==> Invalidating CloudFront distribution $CLOUDFRONT_DISTRIBUTION_ID"
+              aws cloudfront create-invalidation --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" --paths "/*"
             fi
-            printf "https://$(params.s3-bucket).s3.amazonaws.com" > $(results.deploy-url.path)
+            URL="https://$S3_BUCKET.s3.amazonaws.com"
             ;;
 
-          # ---------------------------------------------------------------
           rsync)
-            apk add --no-cache openssh-client rsync
-            REMOTE="$(params.ssh-user)@$(params.ssh-host):$(params.remote-dir)/"
-            rsync -avz --progress \
-              -e "ssh -p $(params.ssh-port)" \
-              $(params.rsync-extra-args) \
-              "$SRC/$(params.rsync-source-path)/" \
-              "$REMOTE"
-            printf "http://$(params.ssh-host)" > $(results.deploy-url.path)
+            ssh_setup
+            apk add --no-cache rsync >/dev/null
+            # $RSYNC_EXTRA_ARGS is a validated, space separated list of extra flags.
+            # shellcheck disable=SC2086
+            rsync -az -e "ssh $SSH_OPTS" $RSYNC_EXTRA_ARGS \
+              "$SRC/$RSYNC_SOURCE_PATH/" "$SSH_USER@$SSH_HOST:$REMOTE_DIR/"
+            URL="http://$SSH_HOST"
             ;;
 
           *)
-            echo "ERROR: Unknown deploy-target '$(params.deploy-target)'"
-            echo "Valid values: ssh-build | docker-compose | k8s | helm | s3-cloudfront | rsync"
+            echo "ERROR: unknown deploy-target '$TARGET'" >&2
+            echo "Valid values: ssh-build | docker-compose | k8s | helm | s3-cloudfront | rsync" >&2
             exit 1
             ;;
         esac
 
         echo "==> Deployment complete"
-        printf 'success' > $(results.deploy-status.path)
-      env:
-        - name: HOME
-          value: /root
+        printf '%s' "$URL" > "$(results.deploy-url.path)"
+        printf 'success' > "$(results.deploy-status.path)"
       computeResources:
         requests:
           cpu: 200m

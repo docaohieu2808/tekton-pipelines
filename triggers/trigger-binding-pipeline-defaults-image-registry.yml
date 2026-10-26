@@ -1,0 +1,15 @@
+# Static settings shared by every provider trigger: where images are pushed.
+# Edit image-repository for your registry. Set insecure-registry to "true" only for
+# a plain-HTTP test registry (the CI workflow does this for its in-cluster registry).
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: pipeline-defaults
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+spec:
+  params:
+    - name: image-repository
+      value: registry.example.com/team
+    - name: insecure-registry
+      value: "false"

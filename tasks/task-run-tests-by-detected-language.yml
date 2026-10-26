@@ -6,24 +6,25 @@ metadata:
     app.kubernetes.io/part-of: auto-pipeline
 spec:
   description: |
-    Runs the test suite using the language/build-tool detected by detect-language task.
+    Runs the test suite in the toolchain image chosen by the detect-language task.
     Supports: node (npm/yarn/pnpm), java (maven/gradle), go, python (pip/poetry),
-    php (composer/phpunit), rust (cargo). Outputs test results as JUnit XML when possible.
+    php (composer/phpunit), rust (cargo). A failing test fails the Task. JUnit XML is
+    copied to the test-results workspace for maven, gradle, python and phpunit (go and
+    cargo have no built-in JUnit output).
   params:
+    - name: builder-image
+      description: Image with the toolchain for the detected language (result of detect-language)
+      type: string
     - name: language
       description: Language detected by detect-language task
       type: string
     - name: build-tool
       description: Build tool detected by detect-language task
       type: string
-    - name: test-command
-      description: Test command detected by detect-language task (used as fallback)
-      type: string
-      default: ""
     - name: extra-test-args
-      description: Additional arguments appended to the test command
-      type: string
-      default: ""
+      description: Additional arguments appended to the test command, one per array item
+      type: array
+      default: []
     - name: skip-tests
       description: Set to "true" to skip running tests
       type: string
@@ -36,57 +37,67 @@ spec:
       optional: true
   results:
     - name: test-status
-      description: Status of the test run (success/skipped/failure)
-    - name: tests-passed
-      description: Number of tests passed (if detectable)
-    - name: tests-failed
-      description: Number of tests failed (if detectable)
+      description: Status of the test run (success or skipped; a failure fails the Task)
   steps:
     - name: test
-      image: alpine:3.19
+      image: $(params.builder-image)
+      workingDir: $(workspaces.source.path)
+      env:
+        - name: LANGUAGE
+          value: $(params.language)
+        - name: BUILD_TOOL
+          value: $(params.build-tool)
+        - name: SKIP
+          value: $(params.skip-tests)
+        - name: RESULTS_BOUND
+          value: $(workspaces.test-results.bound)
+        - name: RESULTS_DIR
+          value: $(workspaces.test-results.path)
+        - name: GOPATH
+          value: /workspace/go
+        - name: GOCACHE
+          value: /workspace/go-cache
+        - name: npm_config_cache
+          value: /workspace/npm-cache
+        - name: MAVEN_OPTS
+          value: "-Dmaven.repo.local=/workspace/maven-cache"
+      args: ["$(params.extra-test-args[*])"]
       script: |
         #!/bin/sh
-        set -e
-        SRC="$(workspaces.source.path)"
-        cd "$SRC"
-
-        LANGUAGE="$(params.language)"
-        BUILD_TOOL="$(params.build-tool)"
-        EXTRA="$(params.extra-test-args)"
-        SKIP="$(params.skip-tests)"
-        DETECTED_CMD="$(params.test-command)"
+        set -eu
 
         if [ "$SKIP" = "true" ]; then
           echo "==> Tests skipped by param skip-tests=true"
-          printf 'skipped' > $(results.test-status.path)
-          printf '0'       > $(results.tests-passed.path)
-          printf '0'       > $(results.tests-failed.path)
+          printf 'skipped' > "$(results.test-status.path)"
           exit 0
         fi
 
-        RESULTS_DIR=""
-        if [ "$(workspaces.test-results.bound)" = "true" ]; then
-          RESULTS_DIR="$(workspaces.test-results.path)"
-        fi
+        # Copy JUnit XML files found under $1 into the results workspace, if one is bound.
+        collect() {
+          if [ "$RESULTS_BOUND" = "true" ]; then
+            find "$1" -name '*.xml' -exec cp {} "$RESULTS_DIR/" \;
+          fi
+        }
 
         echo "==> Running tests: language=$LANGUAGE build-tool=$BUILD_TOOL"
 
+        # "$@" holds the extra args (one per array item).
         case "$LANGUAGE" in
           node)
             case "$BUILD_TOOL" in
               pnpm)
                 npm install -g pnpm
                 pnpm install --frozen-lockfile
-                pnpm test $EXTRA
+                pnpm test "$@"
                 ;;
               yarn)
                 npm install -g yarn
                 yarn install --frozen-lockfile
-                yarn test --passWithNoTests $EXTRA
+                yarn test "$@"
                 ;;
               *)
-                npm ci --prefer-offline || npm install
-                npm test -- --passWithNoTests $EXTRA
+                npm ci
+                npm test -- "$@"
                 ;;
             esac
             ;;
@@ -94,36 +105,22 @@ spec:
           java)
             case "$BUILD_TOOL" in
               gradle)
-                chmod +x ./gradlew 2>/dev/null || true
-                if [ -n "$RESULTS_DIR" ]; then
-                  ./gradlew test $EXTRA
-                  cp -r build/test-results/test/*.xml "$RESULTS_DIR/" 2>/dev/null || true
+                if [ -f ./gradlew ]; then
+                  sh ./gradlew test "$@"
                 else
-                  ./gradlew test $EXTRA
+                  gradle test "$@"
                 fi
+                collect build/test-results/test
                 ;;
               *)
-                if [ -n "$RESULTS_DIR" ]; then
-                  mvn test $EXTRA
-                  cp -r target/surefire-reports/*.xml "$RESULTS_DIR/" 2>/dev/null || true
-                else
-                  mvn test $EXTRA
-                fi
+                mvn --batch-mode test "$@"
+                collect target/surefire-reports
                 ;;
             esac
             ;;
 
           go)
-            if [ -n "$RESULTS_DIR" ]; then
-              go install gotest.tools/gotestsum@latest 2>/dev/null || true
-              if command -v gotestsum >/dev/null 2>&1; then
-                gotestsum --junitfile "$RESULTS_DIR/results.xml" -- ./... $EXTRA
-              else
-                go test ./... $EXTRA
-              fi
-            else
-              go test -v ./... $EXTRA
-            fi
+            go test ./... "$@"
             ;;
 
           python)
@@ -131,59 +128,37 @@ spec:
               poetry)
                 pip install poetry
                 poetry install
-                if [ -n "$RESULTS_DIR" ]; then
-                  poetry run pytest --junitxml="$RESULTS_DIR/results.xml" $EXTRA
-                else
-                  poetry run pytest $EXTRA
-                fi
+                poetry run pytest --junitxml=/tmp/results.xml "$@"
                 ;;
               *)
-                pip install pytest
-                if [ -n "$RESULTS_DIR" ]; then
-                  python -m pytest --junitxml="$RESULTS_DIR/results.xml" $EXTRA
-                else
-                  python -m pytest $EXTRA
+                if [ -f requirements.txt ]; then
+                  pip install -r requirements.txt
                 fi
+                pip install pytest
+                python -m pytest --junitxml=/tmp/results.xml "$@"
                 ;;
             esac
+            collect /tmp
             ;;
 
           php)
             composer install
-            if [ -f "vendor/bin/phpunit" ]; then
-              if [ -n "$RESULTS_DIR" ]; then
-                ./vendor/bin/phpunit --log-junit "$RESULTS_DIR/results.xml" $EXTRA
-              else
-                ./vendor/bin/phpunit $EXTRA
-              fi
-            else
-              echo "==> No phpunit found, skipping"
-            fi
+            ./vendor/bin/phpunit --log-junit /tmp/results.xml "$@"
+            collect /tmp
             ;;
 
           rust)
-            cargo test $EXTRA
+            cargo test "$@"
             ;;
 
           *)
-            if [ -n "$DETECTED_CMD" ]; then
-              echo "==> Running detected test command: $DETECTED_CMD"
-              sh -c "$DETECTED_CMD $EXTRA"
-            else
-              echo "==> Unknown language '$LANGUAGE', skipping tests"
-            fi
+            echo "ERROR: cannot test unknown language '$LANGUAGE'" >&2
+            exit 1
             ;;
         esac
 
-        echo "==> Tests complete"
-        printf 'success' > $(results.test-status.path)
-        printf '0'       > $(results.tests-passed.path)
-        printf '0'       > $(results.tests-failed.path)
-      env:
-        - name: GOPATH
-          value: /workspace/go
-        - name: GOCACHE
-          value: /workspace/go-cache
+        echo "==> Tests passed"
+        printf 'success' > "$(results.test-status.path)"
       computeResources:
         requests:
           cpu: 500m

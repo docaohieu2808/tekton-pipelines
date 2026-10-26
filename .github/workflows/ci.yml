@@ -1,0 +1,75 @@
+# Proves the repo does what the README says, on every push and once a week:
+# - lint: yamllint, shellcheck on the CI scripts and on every script embedded in a Task,
+#   and kubeconform in strict mode against schemas built from the Tekton CRDs;
+# - e2e: a kind cluster with Tekton Pipelines, Triggers and Chains. The manifests are applied
+#   as in the README, auto-pipeline builds a tiny Node app from an in-cluster git server with
+#   Buildah, pushes it to an in-cluster registry, Chains signs it and cosign verifies it. A
+#   fixture with a failing test must turn the pipeline red, and webhooks are sent to the
+#   EventListener to check that every provider rejects bad signatures.
+name: ci
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: yamllint
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet yamllint==1.38.0 pyyaml
+          "$RUNNER_TEMP/venv/bin/yamllint" --strict .
+      - name: shellcheck (CI and install scripts)
+        run: shellcheck -x ci/*.sh scripts/*.sh
+      - name: shellcheck (scripts embedded in the Tasks)
+        run: python3 -I ci/shellcheck-embedded-scripts.py tasks
+      - name: kubeconform (strict, with Tekton CRD schemas)
+        env:
+          KUBECONFORM_VERSION: v0.8.0
+        run: |
+          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar xz -C "$RUNNER_TEMP" kubeconform
+          export PATH="$RUNNER_TEMP:$PATH"
+          ci/generate-tekton-crd-schemas.sh "$RUNNER_TEMP/schemas"
+          ci/validate-manifests-with-kubeconform.sh "$RUNNER_TEMP/schemas"
+
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.33.0
+          cluster_name: tekton
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.4
+      - name: Install Tekton, apply the manifests
+        run: ci/bootstrap-cluster.sh
+      - name: A passing app is built, pushed, signed and verified
+        run: ci/test-successful-run-is-signed.sh
+      - name: A failing test turns the pipeline red
+        run: ci/test-failing-tests-fail-the-pipeline.sh
+      - name: Webhooks are authenticated
+        run: ci/test-webhook-triggers.sh
+      - name: Cluster state on failure
+        if: failure()
+        run: |
+          kubectl get pods -A
+          kubectl get pipelinerun,taskrun -A
+          kubectl logs -n tekton-chains deploy/tekton-chains-controller --tail=200 || true
+          kubectl logs -n tekton-ci -l eventlistener=git-webhook-listener --tail=100 || true

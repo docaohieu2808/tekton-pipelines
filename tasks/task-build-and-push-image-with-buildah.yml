@@ -1,0 +1,307 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: build-image-buildah
+  labels:
+    app.kubernetes.io/part-of: auto-pipeline
+spec:
+  description: |
+    Builds and pushes an OCI image with Buildah (no Docker daemon, no privileged
+    container; it needs only the SETFCAP capability and the vfs storage driver).
+    Buildah replaces Kaniko, which Google archived in June 2025.
+    Generates a Dockerfile from the detected language when the repo has none.
+    Emits the results IMAGE_URL and IMAGE_DIGEST. Those exact names are the type hints
+    Tekton Chains looks for, so Chains signs and attests the image this Task pushed.
+  params:
+    - name: image
+      description: Full image name with registry and tag (e.g. registry.example.com/myapp:latest)
+      type: string
+    - name: dockerfile-path
+      description: Path to the Dockerfile relative to the source workspace
+      type: string
+      default: ./Dockerfile
+    - name: context
+      description: Build context path relative to the source workspace
+      type: string
+      default: ./
+    - name: language
+      description: Detected language (used to generate a Dockerfile if none exists)
+      type: string
+      default: "unknown"
+    - name: framework
+      description: Detected framework (used to generate a Dockerfile if none exists)
+      type: string
+      default: "none"
+    - name: build-tool
+      description: Detected build tool (used to generate a Dockerfile if none exists)
+      type: string
+      default: "none"
+    - name: dockerfile-exists
+      description: Whether a Dockerfile already exists in the repo (true/false)
+      type: string
+      default: "false"
+    - name: extra-build-args
+      description: Extra arguments for buildah build, one per array item (e.g. --build-arg=FOO=bar)
+      type: array
+      default: []
+    - name: skip-push
+      description: Set to "true" to build without pushing (results stay empty, so nothing is signed)
+      type: string
+      default: "false"
+    - name: insecure-registry
+      description: Set to "true" if the registry does not use TLS (local test registries only)
+      type: string
+      default: "false"
+    - name: buildah-image
+      description: Buildah image (pinned; bump it deliberately)
+      type: string
+      default: quay.io/buildah/stable:v1.43.5
+  workspaces:
+    - name: source
+      description: Workspace containing application source code
+    - name: docker-credentials
+      description: Optional workspace holding a Docker config.json (key "config.json") for the push
+      optional: true
+  results:
+    - name: IMAGE_DIGEST
+      description: SHA256 digest of the pushed image (type hint for Tekton Chains)
+    - name: IMAGE_URL
+      description: Image reference that was pushed (type hint for Tekton Chains)
+  steps:
+    - name: generate-dockerfile-if-missing
+      image: alpine:3.24.3
+      env:
+        - name: SRC
+          value: $(workspaces.source.path)
+        - name: LANGUAGE
+          value: $(params.language)
+        - name: FRAMEWORK
+          value: $(params.framework)
+        - name: BUILD_TOOL
+          value: $(params.build-tool)
+        - name: EXISTS
+          value: $(params.dockerfile-exists)
+      securityContext:
+        allowPrivilegeEscalation: false
+      script: |
+        #!/bin/sh
+        set -eu
+
+        if [ "$EXISTS" = "true" ]; then
+          echo "==> Dockerfile already exists, skipping generation"
+          exit 0
+        fi
+
+        echo "==> Generating Dockerfile for language=$LANGUAGE framework=$FRAMEWORK build-tool=$BUILD_TOOL"
+
+        case "$LANGUAGE" in
+          node)
+            case "$BUILD_TOOL" in
+              pnpm)
+                INSTALL_CMD="npm install -g pnpm && pnpm install --frozen-lockfile"
+                BUILD_CMD="pnpm run build"
+                ;;
+              yarn)
+                INSTALL_CMD="npm install -g yarn && yarn install --frozen-lockfile"
+                BUILD_CMD="yarn build"
+                ;;
+              *)
+                INSTALL_CMD="npm ci"
+                BUILD_CMD="npm run build"
+                ;;
+            esac
+            printf '%s\n' \
+              "FROM node:24-alpine AS builder" \
+              "WORKDIR /app" \
+              "COPY . ." \
+              "RUN $INSTALL_CMD" \
+              "RUN $BUILD_CMD" \
+              "" \
+              "FROM node:24-alpine AS runner" \
+              "WORKDIR /app" \
+              "ENV NODE_ENV=production" \
+              "COPY --from=builder /app ./" \
+              "USER node" \
+              "EXPOSE 3000" \
+              'CMD ["node", "dist/index.js"]' \
+              > "$SRC/Dockerfile"
+            ;;
+
+          java)
+            case "$BUILD_TOOL" in
+              gradle)
+                BUILD_CMD="sh ./gradlew build -x test"
+                ARTIFACT_PATH="build/libs/*.jar"
+                ;;
+              *)
+                BUILD_CMD="mvn --batch-mode package -DskipTests"
+                ARTIFACT_PATH="target/*.jar"
+                ;;
+            esac
+            printf '%s\n' \
+              "FROM eclipse-temurin:25-jdk-alpine AS builder" \
+              "WORKDIR /app" \
+              "COPY . ." \
+              "RUN $BUILD_CMD" \
+              "" \
+              "FROM eclipse-temurin:25-jre-alpine AS runner" \
+              "WORKDIR /app" \
+              "COPY --from=builder /app/$ARTIFACT_PATH app.jar" \
+              "EXPOSE 8080" \
+              'ENTRYPOINT ["java", "-jar", "app.jar"]' \
+              > "$SRC/Dockerfile"
+            ;;
+
+          go)
+            printf '%s\n' \
+              "FROM golang:1.27-alpine AS builder" \
+              "WORKDIR /app" \
+              "COPY . ." \
+              "RUN go mod download" \
+              "RUN CGO_ENABLED=0 GOOS=linux go build -o app ." \
+              "" \
+              "FROM gcr.io/distroless/static-debian13" \
+              "WORKDIR /app" \
+              "COPY --from=builder /app/app ." \
+              "EXPOSE 8080" \
+              'ENTRYPOINT ["/app/app"]' \
+              > "$SRC/Dockerfile"
+            ;;
+
+          python)
+            case "$BUILD_TOOL" in
+              poetry)
+                INSTALL_CMD="pip install poetry && poetry install --only main"
+                START_CMD='["poetry", "run", "python", "-m", "app"]'
+                ;;
+              *)
+                INSTALL_CMD="pip install --no-cache-dir -r requirements.txt"
+                START_CMD='["python", "-m", "app"]'
+                ;;
+            esac
+            case "$FRAMEWORK" in
+              django)   START_CMD='["python", "manage.py", "runserver", "0.0.0.0:8000"]'; PORT=8000 ;;
+              fastapi)  START_CMD='["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]'; PORT=8000 ;;
+              flask)    START_CMD='["flask", "run", "--host=0.0.0.0"]'; PORT=5000 ;;
+              *)        PORT=8000 ;;
+            esac
+            printf '%s\n' \
+              "FROM python:3.14-slim" \
+              "WORKDIR /app" \
+              "COPY . ." \
+              "RUN $INSTALL_CMD" \
+              "EXPOSE $PORT" \
+              "CMD $START_CMD" \
+              > "$SRC/Dockerfile"
+            ;;
+
+          php)
+            printf '%s\n' \
+              "FROM composer:2 AS builder" \
+              "WORKDIR /app" \
+              "COPY composer*.json ./" \
+              "RUN composer install --no-dev --optimize-autoloader --no-scripts" \
+              "COPY . ." \
+              "" \
+              "FROM php:8.5-fpm-alpine AS runner" \
+              "WORKDIR /app" \
+              "COPY --from=builder /app ." \
+              "EXPOSE 9000" \
+              'CMD ["php-fpm"]' \
+              > "$SRC/Dockerfile"
+            ;;
+
+          rust)
+            printf '%s\n' \
+              "FROM rust:1-alpine AS builder" \
+              "RUN apk add --no-cache musl-dev" \
+              "WORKDIR /app" \
+              "COPY . ." \
+              "RUN cargo build --release" \
+              "" \
+              "FROM gcr.io/distroless/static-debian13" \
+              "COPY --from=builder /app/target/release/app /app" \
+              "EXPOSE 8080" \
+              'ENTRYPOINT ["/app"]' \
+              > "$SRC/Dockerfile"
+            ;;
+
+          *)
+            echo "ERROR: cannot generate a Dockerfile for unknown language '$LANGUAGE'." >&2
+            echo "       Add a Dockerfile to your repository." >&2
+            exit 1
+            ;;
+        esac
+
+        echo "==> Generated Dockerfile:"
+        cat "$SRC/Dockerfile"
+
+    - name: buildah-build-and-push
+      image: $(params.buildah-image)
+      workingDir: $(workspaces.source.path)
+      env:
+        - name: IMAGE
+          value: $(params.image)
+        - name: CONTEXT
+          value: $(params.context)
+        - name: DOCKERFILE
+          value: $(params.dockerfile-path)
+        - name: SKIP_PUSH
+          value: $(params.skip-push)
+        - name: INSECURE
+          value: $(params.insecure-registry)
+        - name: CREDS_BOUND
+          value: $(workspaces.docker-credentials.bound)
+        - name: CREDS_DIR
+          value: $(workspaces.docker-credentials.path)
+        - name: STORAGE_DRIVER
+          value: vfs
+        - name: BUILDAH_ISOLATION
+          value: chroot
+      # Rootless-style build without a privileged pod: only SETFCAP is added so layers
+      # that contain file capabilities can be unpacked.
+      securityContext:
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        capabilities:
+          add: ["SETFCAP"]
+      args: ["$(params.extra-build-args[*])"]
+      script: |
+        #!/bin/sh
+        set -eu
+
+        TLS_VERIFY=true
+        if [ "$INSECURE" = "true" ]; then TLS_VERIFY=false; fi
+
+        AUTH_ARGS=""
+        if [ "$CREDS_BOUND" = "true" ] && [ -f "$CREDS_DIR/config.json" ]; then
+          AUTH_ARGS="--authfile $CREDS_DIR/config.json"
+        fi
+
+        # "$@" holds the extra build args (one per array item).
+        # shellcheck disable=SC2086
+        buildah build --format oci --tls-verify="$TLS_VERIFY" $AUTH_ARGS \
+          -f "$DOCKERFILE" -t "$IMAGE" "$@" "$CONTEXT"
+
+        if [ "$SKIP_PUSH" = "true" ]; then
+          echo "==> skip-push=true: image built, not pushed, no results emitted"
+          : > "$(results.IMAGE_URL.path)"
+          : > "$(results.IMAGE_DIGEST.path)"
+          exit 0
+        fi
+
+        # shellcheck disable=SC2086
+        buildah push --tls-verify="$TLS_VERIFY" $AUTH_ARGS \
+          --digestfile /tmp/image-digest "$IMAGE" "docker://$IMAGE"
+
+        printf '%s' "$IMAGE" > "$(results.IMAGE_URL.path)"
+        tr -d '\n' < /tmp/image-digest > "$(results.IMAGE_DIGEST.path)"
+        echo "==> Pushed $IMAGE@$(cat /tmp/image-digest)"
+  stepTemplate:
+    computeResources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+      limits:
+        cpu: "2"
+        memory: 2Gi

@@ -6,40 +6,25 @@ metadata:
     app.kubernetes.io/part-of: auto-pipeline
 spec:
   description: |
-    Builds the application using the language/build-tool detected by detect-language task.
+    Builds the application with the toolchain image chosen by the detect-language task
+    (builder-image), so npm, mvn, go, cargo, composer and pip really exist in the step.
     Supports: node (npm/yarn/pnpm), java (maven/gradle), go, python (pip/poetry),
-    php (composer), rust (cargo).
+    php (composer), rust (cargo). An unknown language fails the task instead of
+    pretending the build worked.
   params:
+    - name: builder-image
+      description: Image with the toolchain for the detected language (result of detect-language)
+      type: string
     - name: language
       description: Language detected by detect-language task
       type: string
     - name: build-tool
       description: Build tool detected by detect-language task
       type: string
-    - name: build-command
-      description: Build command detected by detect-language task (used as fallback)
-      type: string
-      default: ""
     - name: extra-build-args
-      description: Additional build arguments appended to the build command
-      type: string
-      default: ""
-    - name: node-version
-      description: Node.js version to use (only for node language)
-      type: string
-      default: "20"
-    - name: java-version
-      description: JDK version to use (only for java language)
-      type: string
-      default: "21"
-    - name: go-version
-      description: Go version to use (only for go language)
-      type: string
-      default: "1.22"
-    - name: python-version
-      description: Python version to use (only for python language)
-      type: string
-      default: "3.12"
+      description: Additional build arguments appended to the build command, one per array item
+      type: array
+      default: []
   workspaces:
     - name: source
       description: Workspace with cloned source code
@@ -48,42 +33,52 @@ spec:
       optional: true
   results:
     - name: build-status
-      description: Status of the build (success/failure)
+      description: Status of the build (success)
     - name: artifact-path
       description: Path to the built artifact within the workspace
   steps:
     - name: build
-      image: alpine:3.19
+      image: $(params.builder-image)
+      workingDir: $(workspaces.source.path)
+      # Params go through env, never straight into the script, so a branch name or
+      # extra arg coming from a webhook cannot inject shell code.
+      env:
+        - name: LANGUAGE
+          value: $(params.language)
+        - name: BUILD_TOOL
+          value: $(params.build-tool)
+        - name: GOPATH
+          value: /workspace/go
+        - name: GOCACHE
+          value: /workspace/go-cache
+        - name: npm_config_cache
+          value: /workspace/npm-cache
+        - name: MAVEN_OPTS
+          value: "-Dmaven.repo.local=/workspace/maven-cache"
+      args: ["$(params.extra-build-args[*])"]
       script: |
         #!/bin/sh
-        set -e
-        SRC="$(workspaces.source.path)"
-        cd "$SRC"
-
-        LANGUAGE="$(params.language)"
-        BUILD_TOOL="$(params.build-tool)"
-        EXTRA="$(params.extra-build-args)"
-        DETECTED_CMD="$(params.build-command)"
+        set -eu
 
         echo "==> Building: language=$LANGUAGE build-tool=$BUILD_TOOL"
 
+        # "$@" holds the extra args (one per array item).
         case "$LANGUAGE" in
           node)
-            echo "==> Installing dependencies with $BUILD_TOOL"
             case "$BUILD_TOOL" in
               pnpm)
                 npm install -g pnpm
                 pnpm install --frozen-lockfile
-                pnpm run build $EXTRA
+                pnpm run build "$@"
                 ;;
               yarn)
                 npm install -g yarn
                 yarn install --frozen-lockfile
-                yarn build $EXTRA
+                yarn build "$@"
                 ;;
               *)
-                npm ci --prefer-offline || npm install
-                npm run build $EXTRA
+                npm ci
+                npm run build -- "$@"
                 ;;
             esac
             ARTIFACT="dist"
@@ -95,19 +90,22 @@ spec:
           java)
             case "$BUILD_TOOL" in
               gradle)
-                chmod +x ./gradlew 2>/dev/null || true
-                ./gradlew build -x test $EXTRA
+                if [ -f ./gradlew ]; then
+                  sh ./gradlew build -x test "$@"
+                else
+                  gradle build -x test "$@"
+                fi
                 ARTIFACT="build/libs"
                 ;;
               *)
-                mvn package -DskipTests $EXTRA
+                mvn --batch-mode package -DskipTests "$@"
                 ARTIFACT="target"
                 ;;
             esac
             ;;
 
           go)
-            go build -o app ./... $EXTRA
+            go build -o app "$@" .
             ARTIFACT="app"
             ;;
 
@@ -115,50 +113,38 @@ spec:
             case "$BUILD_TOOL" in
               poetry)
                 pip install poetry
-                poetry install --no-dev
-                poetry build $EXTRA
+                poetry install --only main
+                poetry build "$@"
                 ARTIFACT="dist"
                 ;;
               *)
-                pip install -r requirements.txt $EXTRA
+                if [ -f requirements.txt ]; then
+                  pip install -r requirements.txt "$@"
+                fi
                 ARTIFACT="."
                 ;;
             esac
             ;;
 
           php)
-            composer install --no-dev --optimize-autoloader $EXTRA
+            composer install --no-dev --optimize-autoloader "$@"
             ARTIFACT="."
             ;;
 
           rust)
-            cargo build --release $EXTRA
+            cargo build --release "$@"
             ARTIFACT="target/release"
             ;;
 
           *)
-            if [ -n "$DETECTED_CMD" ]; then
-              echo "==> Running detected build command: $DETECTED_CMD"
-              sh -c "$DETECTED_CMD $EXTRA"
-            else
-              echo "==> Unknown language '$LANGUAGE', skipping build"
-            fi
-            ARTIFACT="."
+            echo "ERROR: cannot build unknown language '$LANGUAGE'" >&2
+            exit 1
             ;;
         esac
 
         echo "==> Build complete. Artifact: $ARTIFACT"
-        printf 'success'      > $(results.build-status.path)
-        printf '%s' "$ARTIFACT" > $(results.artifact-path.path)
-      env:
-        - name: GOPATH
-          value: /workspace/go
-        - name: GOCACHE
-          value: /workspace/go-cache
-        - name: npm_config_cache
-          value: /workspace/npm-cache
-        - name: MAVEN_OPTS
-          value: "-Dmaven.repo.local=/workspace/maven-cache"
+        printf 'success' > "$(results.build-status.path)"
+        printf '%s' "$ARTIFACT" > "$(results.artifact-path.path)"
       computeResources:
         requests:
           cpu: 500m

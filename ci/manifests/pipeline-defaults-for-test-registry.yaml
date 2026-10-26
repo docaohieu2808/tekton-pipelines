@@ -1,0 +1,12 @@
+# CI replacement for triggers/trigger-binding-pipeline-defaults-image-registry.yml:
+# push to the in-cluster registry over plain HTTP.
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: pipeline-defaults
+spec:
+  params:
+    - name: image-repository
+      value: registry.registry.svc.cluster.local:5000
+    - name: insecure-registry
+      value: "true"

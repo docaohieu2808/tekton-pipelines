@@ -5,53 +5,48 @@
 # 1. Copy this file, rename it to your project (e.g. my-api-trigger.yml)
 # 2. Replace all placeholder values marked with <CHANGE_ME>
 # 3. Create required secrets (see Secret section at bottom)
-# 4. Apply: kubectl apply -f my-api-trigger.yml -n tekton-pipelines
-# 5. Point your Git provider webhook to:
-#    http://<EventListener-LB-IP>:8080
-#    with Content-Type: application/json and your chosen secret
+# 4. Apply: kubectl apply -f my-api-trigger.yml -n tekton-ci
+# 5. Attach the Trigger to the EventListener by adding this entry to
+#    spec.triggers of triggers/event-listener-webhook-github-gitlab-bitbucket-gitea.yml:
+#      - triggerRef: my-api-trigger
+# 6. Expose the Service el-git-webhook-listener (port 8080) through an Ingress with TLS and
+#    point your Git provider webhook at it with Content-Type: application/json and your
+#    webhook secret.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# PVC for the source workspace (one per project is fine; reused across runs)
-# -----------------------------------------------------------------------------
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: my-api-source-pvc
-  namespace: tekton-pipelines
-  labels:
-    app.kubernetes.io/part-of: auto-pipeline
-    project: my-api
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 2Gi
----
-# -----------------------------------------------------------------------------
-# Trigger — wires the EventListener to this project's TriggerTemplate params.
-# One Trigger per project. The EventListener already handles all Git providers;
-# this Trigger just supplies the project-specific overrides.
+# Trigger — one per project, attached to the EventListener with triggerRef. It
+# verifies the webhook, filters on this repository and supplies the project's
+# image registry and deploy settings to the TriggerTemplate.
 # -----------------------------------------------------------------------------
 apiVersion: triggers.tekton.dev/v1beta1
 kind: Trigger
 metadata:
   name: my-api-trigger
-  namespace: tekton-pipelines
+  namespace: tekton-ci
   labels:
     app.kubernetes.io/part-of: auto-pipeline
     project: my-api
 spec:
-  # Intercept only pushes to the main branch for this project.
-  # Remove or adjust the CEL filter to trigger on other branches/tags.
+  # Verify the GitHub signature, then accept only pushes to main of this one repository.
+  # Adjust the CEL filter to trigger on other branches.
   interceptors:
+    - ref:
+        name: github
+        kind: ClusterInterceptor
+      params:
+        - name: secretRef
+          value:
+            secretName: github-webhook-secret
+            secretKey: secret
+        - name: eventTypes
+          value: ["push"]
     - ref:
         name: cel
         kind: ClusterInterceptor
       params:
         - name: filter
-          value: "body.repository.clone_url == 'https://github.com/<CHANGE_ME>/my-api.git' && overlay.git_revision == 'main'"
+          value: "body.repository.clone_url == 'https://github.com/<CHANGE_ME>/my-api.git' && body.ref == 'refs/heads/main'"
 
   bindings:
     # Use the binding that matches your Git provider:
@@ -60,6 +55,7 @@ spec:
     #   git-webhook-binding-bitbucket
     #   git-webhook-binding-gitea
     - ref: git-webhook-binding-github
+    - ref: pipeline-defaults
 
   template:
     ref: auto-pipeline-trigger-template
@@ -69,10 +65,9 @@ spec:
         value: my-api
 
       # --- Docker image to build and push ---
-      # Format: <registry>/<org>/<repo>:<tag>
-      # Use $(tt.params.git-commit-sha) for immutable tags (recommended)
-      - name: image
-        value: ghcr.io/<CHANGE_ME>/my-api:$(tt.params.git-commit-sha)
+      # The image is <image-repository>/<git-repo-name>:<commit sha> (immutable tag).
+      - name: image-repository
+        value: ghcr.io/<CHANGE_ME>
 
       # --- Deploy target ---
       # Options: ssh-build | docker-compose | k8s | helm | s3-cloudfront | rsync | skip
@@ -126,8 +121,8 @@ spec:
       #   value: "dist"
 
       # --- Workspace / secret bindings ---
-      - name: source-pvc
-        value: my-api-source-pvc
+      - name: source-storage
+        value: 2Gi
       - name: docker-credentials-secret
         value: my-api-docker-secret     # <CHANGE_ME> — see secret below
       - name: ssh-credentials-secret
@@ -135,8 +130,6 @@ spec:
 
       # --- Pipeline behaviour ---
       - name: skip-tests
-        value: "false"
-      - name: skip-docker-build
         value: "false"
       - name: skip-push
         value: "false"
@@ -146,39 +139,44 @@ spec:
 # REQUIRED SECRETS — create once per project, then reference by name above
 # =============================================================================
 
-# --- Docker registry credentials ---
-# kubectl create secret docker-registry my-api-docker-secret \
-#   --docker-server=ghcr.io \
-#   --docker-username=<CHANGE_ME> \
-#   --docker-password=<CHANGE_ME_GITHUB_PAT> \
-#   -n tekton-pipelines
+# --- Docker registry credentials (a Docker config.json under the key config.json) ---
+# kubectl create secret generic my-api-docker-secret \
+#   --from-file=config.json=$HOME/.docker/config.json \
+#   -n tekton-ci
 
-# --- SSH deploy key (private key must have deploy access to your server) ---
+# --- SSH deploy key plus the pinned server host key (check the keyscan output by hand) ---
+# ssh-keyscan -p 22 <server> > known_hosts
 # kubectl create secret generic my-api-ssh-secret \
 #   --from-file=id_rsa=$HOME/.ssh/my-api-deploy-key \
-#   -n tekton-pipelines
+#   --from-file=known_hosts=known_hosts \
+#   -n tekton-ci
 
 # --- GitHub webhook HMAC secret (shared with GitHub webhook config) ---
 # kubectl create secret generic github-webhook-secret \
 #   --from-literal=secret=<CHANGE_ME_RANDOM_SECRET> \
-#   -n tekton-pipelines
+#   -n tekton-ci
+
+# --- Bitbucket webhook secret ---
+# kubectl create secret generic bitbucket-webhook-secret \
+#   --from-literal=secret=<CHANGE_ME_BITBUCKET_SECRET> \
+#   -n tekton-ci
 
 # --- GitLab webhook token ---
 # kubectl create secret generic gitlab-webhook-secret \
 #   --from-literal=secret=<CHANGE_ME_GITLAB_TOKEN> \
-#   -n tekton-pipelines
+#   -n tekton-ci
 
 # --- Gitea webhook secret ---
 # kubectl create secret generic gitea-webhook-secret \
 #   --from-literal=secret=<CHANGE_ME_GITEA_SECRET> \
-#   -n tekton-pipelines
+#   -n tekton-ci
 
 # --- kubeconfig for k8s/helm deploy target ---
 # kubectl create secret generic my-api-kubeconfig \
 #   --from-file=config=$HOME/.kube/config \
-#   -n tekton-pipelines
+#   -n tekton-ci
 
 # --- AWS credentials for s3-cloudfront deploy target ---
 # kubectl create secret generic my-api-aws-credentials \
 #   --from-file=credentials=$HOME/.aws/credentials \
-#   -n tekton-pipelines
+#   -n tekton-ci

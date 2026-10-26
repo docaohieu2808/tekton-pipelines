@@ -11,10 +11,12 @@ spec:
     requirements.txt/pyproject.toml/setup.py (Python), composer.json (PHP),
     Cargo.toml (Rust).
   params:
-    - name: source-path
-      description: Path to the cloned source code workspace
+    - name: builder-image-override
+      description: |
+        Image the build and test steps should run in. Leave empty to use the image
+        mapped to the detected language (see the case statement below).
       type: string
-      default: /workspace/source
+      default: ""
   workspaces:
     - name: source
       description: Workspace containing cloned source code
@@ -25,6 +27,10 @@ spec:
       description: Detected framework (e.g. spring, express, gin, django, laravel, actix)
     - name: build-tool
       description: Detected build tool (npm, yarn, pnpm, maven, gradle, go, pip, poetry, composer, cargo)
+    - name: builder-image
+      description: Container image that has the toolchain for the detected language (used by build and test)
+    - name: builder-image
+      description: Container image that has the toolchain for the detected language (used by build and test)
     - name: dockerfile-exists
       description: Whether a Dockerfile already exists (true/false)
     - name: test-command
@@ -33,11 +39,17 @@ spec:
       description: Suggested build command for the detected stack
   steps:
     - name: detect
-      image: alpine:3.19
+      image: alpine:3.24.3
+      env:
+        - name: SRC
+          value: $(workspaces.source.path)
+        - name: IMAGE_OVERRIDE
+          value: $(params.builder-image-override)
+      securityContext:
+        allowPrivilegeEscalation: false
       script: |
         #!/bin/sh
-        set -e
-        SRC="$(workspaces.source.path)"
+        set -eu
 
         LANGUAGE="unknown"
         FRAMEWORK="none"
@@ -108,7 +120,7 @@ spec:
           elif grep -q 'gofiber/fiber' "$SRC/go.mod" 2>/dev/null; then
             FRAMEWORK="fiber"
           fi
-          BUILD_CMD="go build -o app ./..."
+          BUILD_CMD="go build -o app ."
           TEST_CMD="go test ./..."
 
         # --- Python ---
@@ -167,17 +179,49 @@ spec:
           TEST_CMD="cargo test"
         fi
 
+        # --- Toolchain image for build/test (pinned to a major/minor line) ---
+        case "$LANGUAGE:$BUILD_TOOL" in
+          node:*)        BUILDER_IMAGE="node:24-alpine" ;;
+          java:maven)    BUILDER_IMAGE="maven:3.9-eclipse-temurin-25" ;;
+          java:gradle)   BUILDER_IMAGE="gradle:9-jdk25" ;;
+          go:*)          BUILDER_IMAGE="golang:1.27-alpine" ;;
+          python:*)      BUILDER_IMAGE="python:3.14-slim" ;;
+          php:*)         BUILDER_IMAGE="composer:2" ;;
+          rust:*)        BUILDER_IMAGE="rust:1" ;;
+          *)             BUILDER_IMAGE="alpine:3.24.3" ;;
+        esac
+        if [ -n "$IMAGE_OVERRIDE" ]; then
+          BUILDER_IMAGE="$IMAGE_OVERRIDE"
+        fi
+
+        # --- Toolchain image for build/test (pinned to a major/minor line) ---
+        case "$LANGUAGE:$BUILD_TOOL" in
+          node:*)        BUILDER_IMAGE="node:24-alpine" ;;
+          java:maven)    BUILDER_IMAGE="maven:3.9-eclipse-temurin-25" ;;
+          java:gradle)   BUILDER_IMAGE="gradle:9-jdk25" ;;
+          go:*)          BUILDER_IMAGE="golang:1.27-alpine" ;;
+          python:*)      BUILDER_IMAGE="python:3.14-slim" ;;
+          php:*)         BUILDER_IMAGE="composer:2" ;;
+          rust:*)        BUILDER_IMAGE="rust:1" ;;
+          *)             BUILDER_IMAGE="alpine:3.24.3" ;;
+        esac
+        if [ -n "$IMAGE_OVERRIDE" ]; then
+          BUILDER_IMAGE="$IMAGE_OVERRIDE"
+        fi
+
         # --- Dockerfile detection ---
         DOCKERFILE_EXISTS="false"
         if [ -f "$SRC/Dockerfile" ] || [ -f "$SRC/dockerfile" ]; then
           DOCKERFILE_EXISTS="true"
         fi
 
-        echo "Detected: language=$LANGUAGE framework=$FRAMEWORK build-tool=$BUILD_TOOL"
+        echo "Detected: language=$LANGUAGE framework=$FRAMEWORK build-tool=$BUILD_TOOL builder-image=$BUILDER_IMAGE"
         echo "Build: $BUILD_CMD"
         echo "Test: $TEST_CMD"
         echo "Dockerfile exists: $DOCKERFILE_EXISTS"
 
+        printf '%s' "$BUILDER_IMAGE"   > $(results.builder-image.path)
+        printf '%s' "$BUILDER_IMAGE"   > $(results.builder-image.path)
         printf '%s' "$LANGUAGE"        > $(results.language.path)
         printf '%s' "$FRAMEWORK"       > $(results.framework.path)
         printf '%s' "$BUILD_TOOL"      > $(results.build-tool.path)

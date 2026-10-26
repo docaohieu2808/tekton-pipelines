@@ -9,11 +9,17 @@ spec:
   description: |
     Sends a formatted Slack notification via an incoming webhook URL.
     Accepts build status, message, channel, and contextual build info.
-    Uses curl (alpine) — no external dependencies required.
+    The webhook URL is read from a Kubernetes Secret, never passed as a plain param,
+    so it does not show up in the PipelineRun spec or logs. Typical use is as a `finally`
+    task of a Pipeline; it is not wired into auto-pipeline because it needs your Secret.
   params:
-    - name: webhook-url
-      description: Slack incoming webhook URL (store as a Secret and pass via env)
+    - name: webhook-url-secret
+      description: Name of the Secret that holds the Slack incoming webhook URL
       type: string
+    - name: webhook-url-secret-key
+      description: Key inside that Secret
+      type: string
+      default: url
     - name: message
       description: Main notification message text
       type: string
@@ -55,105 +61,79 @@ spec:
       default: ""
   steps:
     - name: send-slack-notification
-      image: alpine:3.19
+      image: alpine:3.24.3
+      env:
+        - name: WEBHOOK_URL
+          valueFrom:
+            secretKeyRef:
+              name: $(params.webhook-url-secret)
+              key: $(params.webhook-url-secret-key)
+        - name: MESSAGE
+          value: $(params.message)
+        - name: STATUS
+          value: $(params.status)
+        - name: CHANNEL
+          value: $(params.channel)
+        - name: PIPELINE
+          value: $(params.pipeline-name)
+        - name: RUN_NAME
+          value: $(params.pipeline-run-name)
+        - name: GIT_REPO
+          value: $(params.git-repo)
+        - name: GIT_BRANCH
+          value: $(params.git-branch)
+        - name: GIT_COMMIT
+          value: $(params.git-commit)
+        - name: AUTHOR
+          value: $(params.author)
+        - name: DASHBOARD_URL
+          value: $(params.dashboard-url)
       script: |
         #!/bin/sh
-        set -e
+        set -eu
+        apk add --no-cache curl jq >/dev/null
 
-        apk add --no-cache curl jq 2>/dev/null
-
-        WEBHOOK_URL="$(params.webhook-url)"
-        MESSAGE="$(params.message)"
-        STATUS="$(params.status)"
-        CHANNEL="$(params.channel)"
-        PIPELINE="$(params.pipeline-name)"
-        RUN_NAME="$(params.pipeline-run-name)"
-        GIT_REPO="$(params.git-repo)"
-        GIT_BRANCH="$(params.git-branch)"
-        GIT_COMMIT="$(params.git-commit)"
-        AUTHOR="$(params.author)"
-        DASHBOARD_URL="$(params.dashboard-url)"
-
-        if [ -z "$WEBHOOK_URL" ]; then
-          echo "ERROR: webhook-url param is required"
-          exit 1
-        fi
-
-        # ── Map status to emoji and Slack color ─────────────────────────────────
         case "$STATUS" in
           success) EMOJI=":white_check_mark:" ; COLOR="good"    ;;
           failure) EMOJI=":x:"               ; COLOR="danger"  ;;
           warning) EMOJI=":warning:"         ; COLOR="warning" ;;
           *)       EMOJI=":information_source:" ; COLOR="#439FE0" ;;
         esac
+        TITLE="${EMOJI} ${STATUS} - ${PIPELINE:-Pipeline}"
 
-        TITLE="${EMOJI} ${STATUS} — ${PIPELINE:-Pipeline}"
-
-        # ── Build run link if dashboard URL provided ─────────────────────────────
         RUN_LINK=""
         if [ -n "$DASHBOARD_URL" ] && [ -n "$RUN_NAME" ]; then
           RUN_LINK="${DASHBOARD_URL}/#/pipelineruns/${RUN_NAME}"
         fi
 
-        # ── Assemble context fields ──────────────────────────────────────────────
-        FIELDS=""
-
-        if [ -n "$GIT_REPO" ]; then
-          FIELDS="${FIELDS}{\"title\":\"Repository\",\"value\":\"${GIT_REPO}\",\"short\":true},"
-        fi
-        if [ -n "$GIT_BRANCH" ]; then
-          FIELDS="${FIELDS}{\"title\":\"Branch\",\"value\":\"${GIT_BRANCH}\",\"short\":true},"
-        fi
-        if [ -n "$GIT_COMMIT" ]; then
-          FIELDS="${FIELDS}{\"title\":\"Commit\",\"value\":\"${GIT_COMMIT}\",\"short\":true},"
-        fi
-        if [ -n "$AUTHOR" ]; then
-          FIELDS="${FIELDS}{\"title\":\"Author\",\"value\":\"${AUTHOR}\",\"short\":true},"
-        fi
-        if [ -n "$RUN_LINK" ]; then
-          FIELDS="${FIELDS}{\"title\":\"Pipeline Run\",\"value\":\"<${RUN_LINK}|${RUN_NAME}>\",\"short\":false},"
-        fi
-
-        # Strip trailing comma
-        FIELDS=$(echo "$FIELDS" | sed 's/,$//')
-
-        # ── Build JSON payload ───────────────────────────────────────────────────
+        # jq builds the JSON, so quotes or newlines in any value cannot break the payload.
         PAYLOAD=$(jq -n \
-          --arg channel "$CHANNEL" \
-          --arg title   "$TITLE" \
-          --arg text    "$MESSAGE" \
-          --arg color   "$COLOR" \
-          --argjson fields "[${FIELDS}]" \
+          --arg channel "$CHANNEL" --arg title "$TITLE" --arg text "$MESSAGE" --arg color "$COLOR" \
+          --arg repo "$GIT_REPO" --arg branch "$GIT_BRANCH" --arg commit "$GIT_COMMIT" \
+          --arg author "$AUTHOR" --arg link "$RUN_LINK" --arg run "$RUN_NAME" \
           '{
             attachments: [{
-              color:      $color,
-              title:      $title,
-              text:       $text,
-              fields:     $fields,
-              footer:     "Tekton CI/CD",
-              footer_icon: "https://tekton.dev/images/tekton-horizontal-color.png",
+              color: $color, title: $title, text: $text,
+              fields: ([
+                {title: "Repository", value: $repo,   short: true},
+                {title: "Branch",     value: $branch, short: true},
+                {title: "Commit",     value: $commit, short: true},
+                {title: "Author",     value: $author, short: true},
+                {title: "Pipeline Run", value: ("<" + $link + "|" + $run + ">"), short: false}
+              ] | map(select(.value != "" and .value != "<|>"))),
+              footer: "Tekton CI/CD",
               ts: (now | floor)
             }]
           } + (if $channel != "" then {channel: $channel} else {} end)')
 
-        echo "==> Sending Slack notification"
-        echo "    Status  : $STATUS"
-        echo "    Channel : ${CHANNEL:-(webhook default)}"
-        echo "    Pipeline: ${PIPELINE:-n/a}"
-
-        HTTP_STATUS=$(curl -s -o /tmp/slack-response.txt -w "%{http_code}" \
-          -X POST \
-          -H "Content-Type: application/json" \
-          --data "$PAYLOAD" \
-          "$WEBHOOK_URL")
-
+        echo "==> Sending Slack notification (status=$STATUS channel=${CHANNEL:-webhook default})"
+        HTTP_STATUS=$(curl -sS -o /tmp/slack-response.txt -w "%{http_code}" \
+          -X POST -H "Content-Type: application/json" --data "$PAYLOAD" "$WEBHOOK_URL")
         RESPONSE=$(cat /tmp/slack-response.txt)
-        echo "    HTTP status : $HTTP_STATUS"
-        echo "    Response    : $RESPONSE"
+        echo "    HTTP status: $HTTP_STATUS  response: $RESPONSE"
 
         if [ "$HTTP_STATUS" != "200" ] || [ "$RESPONSE" != "ok" ]; then
-          echo "ERROR: Slack webhook returned unexpected response"
+          echo "ERROR: Slack webhook returned an unexpected response" >&2
           exit 1
         fi
-
-        echo "==> Slack notification sent successfully"
+        echo "==> Slack notification sent"

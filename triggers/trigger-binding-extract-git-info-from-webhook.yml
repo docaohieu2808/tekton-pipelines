@@ -10,7 +10,7 @@ spec:
     - name: git-url
       value: $(body.repository.clone_url)
     - name: git-revision
-      value: $(body.ref)
+      value: $(body.after)
     - name: git-commit-sha
       value: $(body.after)
     - name: git-repo-name
@@ -30,7 +30,7 @@ spec:
     - name: git-url
       value: $(body.project.http_url)
     - name: git-revision
-      value: $(body.ref)
+      value: $(body.checkout_sha)
     - name: git-commit-sha
       value: $(body.checkout_sha)
     - name: git-repo-name
@@ -50,7 +50,7 @@ spec:
     - name: git-url
       value: $(body.repository.links.html.href)
     - name: git-revision
-      value: $(body.push.changes[0].new.name)
+      value: $(body.push.changes[0].new.target.hash)
     - name: git-commit-sha
       value: $(body.push.changes[0].new.target.hash)
     - name: git-repo-name
@@ -70,7 +70,7 @@ spec:
     - name: git-url
       value: $(body.repository.clone_url)
     - name: git-revision
-      value: $(body.ref)
+      value: $(body.after)
     - name: git-commit-sha
       value: $(body.after)
     - name: git-repo-name

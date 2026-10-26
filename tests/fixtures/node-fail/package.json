@@ -1,0 +1,11 @@
+{
+  "name": "tekton-fixture-fail",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tiny app used by the CI workflow to prove the Tekton pipeline works end to end",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "mkdir -p dist && cp src/index.js dist/index.js",
+    "test": "node --test"
+  }
+}

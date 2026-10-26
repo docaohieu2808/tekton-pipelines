@@ -52,6 +52,7 @@ spec:
                   expression: "body.ref.replace('refs/heads/', '')"
       bindings:
         - ref: git-webhook-binding-github
+        - ref: pipeline-defaults
       template:
         ref: auto-pipeline-trigger-template
 
@@ -72,7 +73,6 @@ spec:
             - name: eventTypes
               value:
                 - Push Hook
-                - Tag Push Hook
         - ref:
             name: cel
             kind: ClusterInterceptor
@@ -87,34 +87,46 @@ spec:
                   expression: "body.ref.replace('refs/heads/', '')"
       bindings:
         - ref: git-webhook-binding-gitlab
+        - ref: pipeline-defaults
       template:
         ref: auto-pipeline-trigger-template
 
     # =========================================================================
-    # Bitbucket Cloud — repo:push events
-    # Verified via IP allowlist or shared secret in custom header
+    # Bitbucket — repo:push events
+    # Authenticated like GitHub: the webhook secret signs the body (X-Hub-Signature)
+    # and the bitbucket interceptor verifies it. Set the secret in the Bitbucket
+    # webhook settings; an unsigned or wrongly signed request is rejected.
     # =========================================================================
     - name: bitbucket-push
       interceptors:
+        - ref:
+            name: bitbucket
+            kind: ClusterInterceptor
+          params:
+            - name: secretRef
+              value:
+                secretName: bitbucket-webhook-secret
+                secretKey: secret
+            - name: eventTypes
+              value:
+                - repo:push
         - ref:
             name: cel
             kind: ClusterInterceptor
           params:
             - name: filter
-              # Bitbucket sends X-Event-Key: repo:push
-              value: "header.match('X-Event-Key', 'repo:push')"
-            - name: overlays
-              value:
-                - key: git_revision
-                  expression: "body.push.changes[0].new.name"
+              # Branch pushes only; a deleted branch has no "new" entry.
+              value: "size(body.push.changes) > 0 && body.push.changes[0].new.type == 'branch'"
       bindings:
         - ref: git-webhook-binding-bitbucket
+        - ref: pipeline-defaults
       template:
         ref: auto-pipeline-trigger-template
 
     # =========================================================================
     # Gitea — push events
-    # Webhook secret verified via X-Gitea-Signature (HMAC-SHA256, same as GitHub)
+    # Gitea signs the body with HMAC-SHA256 and also sends the GitHub-compatible
+    # X-Hub-Signature-256 / X-GitHub-Event headers, which the github interceptor verifies.
     # =========================================================================
     - name: gitea-push
       interceptors:
@@ -143,43 +155,21 @@ spec:
                   expression: "body.ref.replace('refs/heads/', '')"
       bindings:
         - ref: git-webhook-binding-gitea
+        - ref: pipeline-defaults
       template:
         ref: auto-pipeline-trigger-template
 
 ---
-# ServiceAccount with minimum RBAC for the EventListener pod
+# ServiceAccount the EventListener pod runs as. Permissions come from the two
+# ClusterRoles that the Tekton Triggers release ships for exactly this purpose
+# (read triggers/bindings/templates, create PipelineRuns, read secrets for the
+# interceptors, read ClusterInterceptors). Nothing broader is granted here.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: tekton-triggers-sa
   labels:
     app.kubernetes.io/part-of: auto-pipeline
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: tekton-triggers-role
-  labels:
-    app.kubernetes.io/part-of: auto-pipeline
-rules:
-  - apiGroups: ["triggers.tekton.dev"]
-    resources:
-      - eventlisteners
-      - triggerbindings
-      - triggertemplates
-      - triggers
-      - clusterinterceptors
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["tekton.dev"]
-    resources:
-      - pipelineruns
-      - pipelineresources
-    verbs: ["create", "get", "list", "watch"]
-  - apiGroups: [""]
-    resources:
-      - configmaps
-      - secrets
-    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -190,45 +180,26 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: tekton-triggers-sa
+    namespace: tekton-ci
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: tekton-triggers-role
+  kind: ClusterRole
+  name: tekton-triggers-eventlistener-roles
 ---
-# ClusterRoleBinding for ClusterInterceptor access
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: tekton-triggers-clusterrolebinding
+  name: tekton-ci-triggers-clusterrolebinding
   labels:
     app.kubernetes.io/part-of: auto-pipeline
 subjects:
   - kind: ServiceAccount
     name: tekton-triggers-sa
-    namespace: tekton-pipelines
+    namespace: tekton-ci
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: tekton-triggers-eventlistener-clusterrole
----
-# Expose EventListener via a LoadBalancer Service for external webhook ingress.
-# For production, replace with an Ingress + cert-manager TLS termination.
-apiVersion: v1
-kind: Service
-metadata:
-  name: git-webhook-listener-svc
-  labels:
-    app.kubernetes.io/part-of: auto-pipeline
-  annotations:
-    # Uncomment to use internal LB on cloud providers
-    # service.beta.kubernetes.io/aws-load-balancer-internal: "true"
-spec:
-  selector:
-    app.kubernetes.io/managed-by: EventListener
-    eventlistener: git-webhook-listener
-  ports:
-    - name: http-webhook
-      protocol: TCP
-      port: 8080
-      targetPort: 8080
-  type: LoadBalancer
+  name: tekton-triggers-eventlistener-clusterroles
+# No Service is declared here. The EventListener creates a ClusterIP Service named
+# el-git-webhook-listener on port 8080. Publish it through an Ingress with TLS
+# (cert-manager) instead of a plain-HTTP LoadBalancer.

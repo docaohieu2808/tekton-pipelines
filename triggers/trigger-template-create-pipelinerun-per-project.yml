@@ -8,14 +8,13 @@ spec:
   description: |
     Creates a PipelineRun for auto-pipeline on every webhook push event.
     Projects register themselves by creating a Trigger that references this
-    TriggerTemplate and supplies project-specific params as resourcetemplates
-    overrides (image, deploy-target, etc.).
+    TriggerTemplate and supplies project-specific params (image, deploy-target, etc.).
   params:
     # --- injected by TriggerBinding ---
     - name: git-url
       description: Repository clone URL
     - name: git-revision
-      description: Git ref (e.g. refs/heads/main)
+      description: Git revision to check out (the pushed commit SHA)
       default: main
     - name: git-commit-sha
       description: Full commit SHA
@@ -25,11 +24,15 @@ spec:
       default: app
 
     # --- project-specific (set per Trigger) ---
-    - name: image
-      description: Full Docker image ref to build/push (registry/name:tag)
+    - name: image-repository
+      description: Registry path images are pushed under; the image is <image-repository>/<repo name>:<commit sha>
       default: ""
-    - name: skip-docker-build
+    - name: insecure-registry
+      description: '"true" only for a plain-HTTP registry (local test registries)'
       default: "false"
+    - name: builder-image-override
+      description: Force this toolchain image for build and test (empty = mapped from the detected language)
+      default: ""
     - name: skip-push
       default: "false"
     - name: skip-tests
@@ -83,14 +86,11 @@ spec:
       default: "--exclude=.git --exclude=node_modules"
 
     # --- workspace/volume config ---
-    - name: source-pvc
-      description: PVC name to use for the source workspace (must exist in namespace)
-      default: "pipeline-source-pvc"
-    - name: cache-pvc
-      description: PVC name for dependency cache (leave empty to skip)
-      default: ""
+    - name: source-storage
+      description: Size of the per-run source volume
+      default: "2Gi"
     - name: docker-credentials-secret
-      description: Secret name containing .dockerconfigjson for image push
+      description: Secret with a config.json key (Docker config) for image push and SBOM scan
       default: "docker-registry-credentials"
     - name: ssh-credentials-secret
       description: Secret name containing id_rsa SSH key for deploy
@@ -126,9 +126,11 @@ spec:
           - name: git-commit-sha
             value: $(tt.params.git-commit-sha)
           - name: image
-            value: $(tt.params.image)
-          - name: skip-docker-build
-            value: $(tt.params.skip-docker-build)
+            value: $(tt.params.image-repository)/$(tt.params.git-repo-name):$(tt.params.git-commit-sha)
+          - name: insecure-registry
+            value: $(tt.params.insecure-registry)
+          - name: builder-image-override
+            value: $(tt.params.builder-image-override)
           - name: skip-push
             value: $(tt.params.skip-push)
           - name: skip-tests
@@ -177,15 +179,25 @@ spec:
             value: $(tt.params.rsync-source-path)
           - name: rsync-extra-args
             value: $(tt.params.rsync-extra-args)
+        # git-clone runs as uid 65532, so the volume must be group-writable for it.
+        taskRunTemplate:
+          podTemplate:
+            securityContext:
+              fsGroup: 65532
         workspaces:
+          # One fresh volume per run, so concurrent runs never share a checkout.
           - name: source
-            persistentVolumeClaim:
-              claimName: $(tt.params.source-pvc)
+            volumeClaimTemplate:
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                resources:
+                  requests:
+                    storage: $(tt.params.source-storage)
           - name: docker-credentials
             secret:
               secretName: $(tt.params.docker-credentials-secret)
-          # cache, ssh, kubeconfig, aws are bound conditionally by project
-          # override in per-project Trigger if needed
+          # ssh-credentials, kubeconfig and aws-credentials are optional workspaces: bind
+          # them in a per-project copy of this template when you use those deploy targets.
         timeouts:
           pipeline: 1h
           tasks: 50m

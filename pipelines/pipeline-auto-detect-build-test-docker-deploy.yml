@@ -7,7 +7,8 @@ metadata:
 spec:
   description: |
     Zero-config CI/CD pipeline that auto-detects language/framework and runs:
-    git-clone → detect-language → build → test → docker-build → deploy
+    git-clone → detect-language → build → test → buildah image build+push → SBOM → deploy
+    The pushed image is signed and attested by Tekton Chains (results IMAGE_URL / IMAGE_DIGEST).
     Works with any Git provider (GitHub, GitLab, Bitbucket, Gitea).
   params:
     # --- Git params ---
@@ -27,14 +28,18 @@ spec:
     - name: image
       description: Full Docker image reference to build and push (registry/name:tag)
       type: string
-    - name: skip-docker-build
-      description: Set to "true" to skip docker build step
-      type: string
-      default: "false"
     - name: skip-push
-      description: Set to "true" to build image without pushing
+      description: Set to "true" to build the image without pushing it (no SBOM, nothing to sign)
       type: string
       default: "false"
+    - name: insecure-registry
+      description: Set to "true" only for a plain-HTTP registry (local test registries)
+      type: string
+      default: "false"
+    - name: builder-image-override
+      description: Force this toolchain image for build and test instead of the one mapped to the detected language
+      type: string
+      default: ""
 
     # --- Test params ---
     - name: skip-tests
@@ -121,7 +126,7 @@ spec:
       description: Optional workspace to store JUnit XML test results
       optional: true
     - name: docker-credentials
-      description: Docker registry credentials (config.json)
+      description: Docker registry credentials (Secret with a config.json key), used for push and SBOM scan
       optional: true
     - name: ssh-credentials
       description: SSH private key (id_rsa) for deploy targets
@@ -136,8 +141,17 @@ spec:
   tasks:
     # -----------------------------------------------------------------------
     - name: git-clone
+      # git-clone comes from the tektoncd-catalog bundle (Tekton Hub is archived).
+      # Pinned to a released version; bump it deliberately.
       taskRef:
-        name: git-clone
+        resolver: bundles
+        params:
+          - name: bundle
+            value: ghcr.io/tektoncd-catalog/git-clone/bundle:v1.7.1
+          - name: name
+            value: git-clone
+          - name: kind
+            value: task
       params:
         - name: url
           value: $(params.git-url)
@@ -155,6 +169,9 @@ spec:
         name: detect-language
       runAfter:
         - git-clone
+      params:
+        - name: builder-image-override
+          value: $(params.builder-image-override)
       workspaces:
         - name: source
           workspace: source
@@ -166,12 +183,12 @@ spec:
       runAfter:
         - detect-language
       params:
+        - name: builder-image
+          value: $(tasks.detect-language.results.builder-image)
         - name: language
           value: $(tasks.detect-language.results.language)
         - name: build-tool
           value: $(tasks.detect-language.results.build-tool)
-        - name: build-command
-          value: $(tasks.detect-language.results.build-command)
       workspaces:
         - name: source
           workspace: source
@@ -185,12 +202,12 @@ spec:
       runAfter:
         - build
       params:
+        - name: builder-image
+          value: $(tasks.detect-language.results.builder-image)
         - name: language
           value: $(tasks.detect-language.results.language)
         - name: build-tool
           value: $(tasks.detect-language.results.build-tool)
-        - name: test-command
-          value: $(tasks.detect-language.results.test-command)
         - name: skip-tests
           value: $(params.skip-tests)
       workspaces:
@@ -202,13 +219,9 @@ spec:
     # -----------------------------------------------------------------------
     - name: docker-build
       taskRef:
-        name: docker-build-kaniko
+        name: build-image-buildah
       runAfter:
         - test
-      when:
-        - input: $(params.skip-docker-build)
-          operator: in
-          values: ["false"]
       params:
         - name: image
           value: $(params.image)
@@ -222,10 +235,31 @@ spec:
           value: $(tasks.detect-language.results.dockerfile-exists)
         - name: skip-push
           value: $(params.skip-push)
+        - name: insecure-registry
+          value: $(params.insecure-registry)
       workspaces:
         - name: source
           workspace: source
         - name: docker-credentials
+          workspace: docker-credentials
+
+    # -----------------------------------------------------------------------
+    - name: generate-sbom
+      taskRef:
+        name: generate-sbom-with-syft
+      when:
+        - input: $(params.skip-push)
+          operator: in
+          values: ["false"]
+      params:
+        - name: scan-target
+          value: registry:$(tasks.docker-build.results.IMAGE_URL)@$(tasks.docker-build.results.IMAGE_DIGEST)
+        - name: insecure-registry
+          value: $(params.insecure-registry)
+      workspaces:
+        - name: output
+          workspace: source
+        - name: registry-credentials
           workspace: docker-credentials
 
     # -----------------------------------------------------------------------
@@ -305,9 +339,10 @@ spec:
     - name: build-tool
       description: Detected build tool
       value: $(tasks.detect-language.results.build-tool)
-    - name: image-digest
-      description: Docker image digest
-      value: $(tasks.docker-build.results.image-digest)
-    - name: deploy-url
-      description: URL of the deployed application
-      value: $(tasks.deploy.results.deploy-url)
+    # Upper-case names are the type hints Tekton Chains reads to find the image to sign.
+    - name: IMAGE_URL
+      description: Image that was pushed
+      value: $(tasks.docker-build.results.IMAGE_URL)
+    - name: IMAGE_DIGEST
+      description: Digest of the image that was pushed
+      value: $(tasks.docker-build.results.IMAGE_DIGEST)

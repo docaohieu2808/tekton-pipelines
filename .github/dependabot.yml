@@ -1,0 +1,12 @@
+# Keeps the pinned actions current. Actions stay pinned to commit SHAs; Dependabot moves them.
+# Image tags and Tekton versions inside the manifests are bumped by hand (they are pinned
+# deliberately and the weekly CI run shows when they stop working).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
