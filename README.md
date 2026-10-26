@@ -166,8 +166,8 @@ Monday 03:23 UTC.
   their toolchain images are pinned, but only Node has a fixture.
 - The registry in CI is plain HTTP and has no login; the signing key has an empty password. Neither is a production setting.
   `transparency.enabled` is `"false"`, so signatures are not in the public Rekor log.
-- `pipeline` results no longer include `deploy-url`: a result that points at a task skipped by `when` cannot be resolved.
-  Read `deploy-url` from the `deploy` TaskRun.
+- The pipeline no longer exposes a `deploy-url` result, because the `deploy` task is skipped by `when` for the default
+  `deploy-target=skip` and a pipeline result must not depend on a task that may not run. Read `deploy-url` from the `deploy` TaskRun.
 - Gitea is verified through the GitHub-compatible headers it sends (`X-Hub-Signature-256`, `X-GitHub-Event`).
 - `skip-docker-build` was removed: the image is the product of the pipeline, and the signed results depend on it.
   Use `skip-push=true` to build without pushing (nothing is signed then).
