@@ -136,7 +136,7 @@ cosign verify-attestation --key cosign.pub --type slsaprovenance1 <registry>/<re
 - **Bitbucket** is authenticated with the `bitbucket` interceptor and a shared secret; before, anyone with the URL could start builds.
   The EventListener is exposed as a ClusterIP Service for an Ingress with TLS, not a plain-HTTP LoadBalancer.
 - **RBAC** uses the ClusterRoles shipped by Triggers; the RoleBinding subject has its namespace.
-- **SBOM** (Syft, `-debug` image because the default one has no shell) is now wired into the pipeline and runs against the pushed image.
+- **SBOM** (Syft, called directly because its image has no shell) is now wired into the pipeline and runs against the pushed image.
 - **Script injection**: every param reaches scripts through `env`, and CI fails on `$(params.*)` inside a script.
 - **Deploy** verifies SSH host keys (a `known_hosts` file is required), validates values that reach a remote shell, and installs
   `kubectl`/`helm` from the Alpine repositories instead of piping a script from `main`.

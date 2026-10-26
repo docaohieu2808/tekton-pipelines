@@ -11,8 +11,7 @@ spec:
     Scans a source directory or a container image in a registry and writes the SBOM
     (SPDX-JSON, CycloneDX-JSON or Syft-JSON) into the output workspace, where later
     tasks (or a PersistentVolume you archive) can pick it up.
-    Uses the "-debug" Syft image because the default one is distroless and has no
-    /bin/sh to run the step script.
+    The Syft image is distroless (no shell), so the step runs the binary directly with args.
   params:
     - name: scan-target
       description: |
@@ -32,9 +31,9 @@ spec:
       type: string
       default: "false"
     - name: syft-image
-      description: Syft image, pinned. Must be a "-debug" tag (needs a shell).
+      description: Syft image (pinned; bump it deliberately)
       type: string
-      default: "anchore/syft:v1.55.0-debug"
+      default: "anchore/syft:v1.55.0"
   workspaces:
     - name: output
       description: Workspace where the SBOM file is written
@@ -51,39 +50,21 @@ spec:
   steps:
     - name: generate-sbom
       image: $(params.syft-image)
+      # Syft is a distroless image: no shell, so it is called directly. Params are plain
+      # args, which cannot inject anything.
+      args:
+        - scan
+        - $(params.scan-target)
+        - --output
+        - $(params.output-format)=$(workspaces.output.path)/$(params.output-file)
       env:
-        - name: SCAN_TARGET
-          value: $(params.scan-target)
-        - name: OUTPUT_FORMAT
-          value: $(params.output-format)
-        - name: OUTPUT_PATH
-          value: $(workspaces.output.path)/$(params.output-file)
-        - name: INSECURE
+        - name: SYFT_REGISTRY_INSECURE_USE_HTTP
           value: $(params.insecure-registry)
-        - name: CREDS_BOUND
-          value: $(workspaces.registry-credentials.bound)
-        - name: CREDS_DIR
-          value: $(workspaces.registry-credentials.path)
         - name: SYFT_CHECK_FOR_APP_UPDATE
           value: "false"
-      script: |
-        #!/bin/sh
-        set -eu
-
-        echo "==> Syft SBOM generation"
-        echo "    Target : $SCAN_TARGET"
-        echo "    Format : $OUTPUT_FORMAT"
-        echo "    Output : $OUTPUT_PATH"
-
-        if [ "$INSECURE" = "true" ]; then
-          export SYFT_REGISTRY_INSECURE_USE_HTTP=true
-        fi
-        if [ "$CREDS_BOUND" = "true" ] && [ -f "$CREDS_DIR/config.json" ]; then
-          export DOCKER_CONFIG="$CREDS_DIR"
-        fi
-
-        syft scan "$SCAN_TARGET" --output "${OUTPUT_FORMAT}=${OUTPUT_PATH}"
-        echo "==> SBOM written to $OUTPUT_PATH"
+        # Directory with config.json when the registry-credentials workspace is bound.
+        - name: DOCKER_CONFIG
+          value: $(workspaces.registry-credentials.path)
 
     - name: summarize-sbom
       image: alpine:3.24.3
