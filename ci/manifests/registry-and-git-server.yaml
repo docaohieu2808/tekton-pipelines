@@ -58,12 +58,10 @@ spec:
       containers:
         - name: git-daemon
           image: alpine/git:v2.54.0
+          # The alpine/git image has no git-daemon; install it, then serve /srv/git.
+          command: ["sh", "-c"]
           args:
-            - daemon
-            - --reuseaddr
-            - --base-path=/srv/git
-            - --export-all
-            - --enable=receive-pack
+            - apk add --no-cache git-daemon >/dev/null && exec git daemon --reuseaddr --base-path=/srv/git --export-all --enable=receive-pack
           ports:
             - containerPort: 9418
           readinessProbe:

@@ -70,6 +70,7 @@ jobs:
         if: failure()
         run: |
           kubectl get pods -A
+          kubectl logs -n git deploy/git-server --tail=50 || true
           kubectl get pipelinerun,taskrun -A
           kubectl logs -n tekton-chains deploy/tekton-chains-controller --tail=200 || true
           kubectl logs -n tekton-ci -l eventlistener=git-webhook-listener --tail=100 || true
