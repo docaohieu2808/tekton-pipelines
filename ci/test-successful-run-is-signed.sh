@@ -54,7 +54,24 @@ kubectl get secret signing-secrets -n tekton-chains -o jsonpath='{.data.cosign\.
 port_forward registry registry 5000 5000
 ref="localhost:5000/fixture-pass@${digest}"
 
-cosign verify --key /tmp/cosign.pub --allow-insecure-registry --insecure-ignore-tlog "$ref" > /tmp/verify.json
+# Chains writes the signature and the two attestations (TaskRun and PipelineRun) to the same
+# registry tags one after the other, so give the registry a moment to hold the final state.
+verified=""
+for _ in $(seq 1 12); do
+  if cosign verify --key /tmp/cosign.pub --allow-insecure-registry --insecure-ignore-tlog "$ref" > /tmp/verify.json 2>/tmp/verify.err; then
+    verified=yes
+    break
+  fi
+  sleep 5
+done
+if [ -z "$verified" ]; then
+  cat /tmp/verify.err >&2
+  echo "registry tags after the run:" >&2
+  curl -s http://localhost:5000/v2/fixture-pass/tags/list >&2 || true
+  kubectl logs -n tekton-chains deploy/tekton-chains-controller --tail=60 >&2 || true
+  echo "FAIL: cosign could not verify the image signature" >&2
+  exit 1
+fi
 jq -e --arg d "$digest" '.[0].critical.image["docker-manifest-digest"] == $d' /tmp/verify.json >/dev/null
 echo "ok   cosign verify: signature is valid for $digest"
 
