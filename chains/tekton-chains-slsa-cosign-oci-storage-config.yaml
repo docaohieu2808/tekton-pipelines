@@ -60,6 +60,11 @@ data:
   # public images and verify with cosign without --insecure-ignore-tlog.
   transparency.enabled: "false"
 
+  # -- Registry transport ------------------------------------------------------
+  # Default (false) means HTTPS with certificate checks. Set "true" only for a throw-away
+  # test registry that serves plain HTTP; the CI workflow does exactly that for its in-cluster registry.
+  storage.oci.repository.insecure: "false"
+
   # -- Builder identity -------------------------------------------------------
   # Value of builder.id in the provenance. This is Chains' default; replace it with a URL
   # that identifies your own Tekton installation if you want to tell installations apart.

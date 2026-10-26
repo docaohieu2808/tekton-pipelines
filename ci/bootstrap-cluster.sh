@@ -14,6 +14,9 @@ kubectl rollout status deployment/git-server -n git --timeout=180s
 # Chains signing key. Empty password only because this is a throw-away CI cluster.
 COSIGN_PASSWORD='' cosign generate-key-pair k8s://tekton-chains/signing-secrets
 kubectl apply -f chains/
+# The CI registry speaks plain HTTP; production keeps the default (false).
+kubectl patch configmap chains-config -n tekton-chains --type merge \
+  -p '{"data":{"storage.oci.repository.insecure":"true"}}'
 
 kubectl create namespace tekton-ci
 # Webhook secrets: random per run, kept in the cluster and read back by the webhook test.
